@@ -2,6 +2,8 @@
 
 `diffloop` is a Pi extension that puts every `edit` and `write` proposal through a human review loop before the tool executes.
 
+![image](./assets/image.png)
+
 It is designed for cases where you want to inspect file changes, understand why the agent is making them, and either approve, steer, revise, or deny the proposal.
 
 ## What it does
