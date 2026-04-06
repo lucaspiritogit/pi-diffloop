@@ -1,6 +1,7 @@
 {
   "name": "@lpirito/pi-diffloop",
   "version": "0.0.1",
+  "main": "index.ts",
   "description": "Human-in-the-loop review for Pi edit/write tool calls",
   "scripts": {
     "typecheck": "bunx tsc -p tsconfig.json",
