@@ -238,11 +238,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
           continue;
         }
 
-        if (ctx.isIdle()) {
-          pi.sendUserMessage(message);
-        } else {
-          pi.sendUserMessage(message, { deliverAs: "steer" });
-        }
+        pi.sendUserMessage(message, { deliverAs: "steer" });
         ctx.ui.notify(`Steering sent for ${event.toolName} ${review.path}`, "warning");
         return { block: true, reason: `Developer steered ${event.toolName} for ${review.path}` };
       }
@@ -544,6 +540,8 @@ export function buildSteeringInstruction(
     `Do not execute the previously proposed ${toolName} for ${normalizedPath}.`,
     `Revise the ${toolName} proposal for ${normalizedPath} based on this developer feedback: ${feedback}`,
     currentReason ? `Previous rationale: ${currentReason}` : undefined,
+    `Keep the review flow going by replying with an updated ${toolName} tool call for ${normalizedPath}.`,
+    "Do not end with a normal text response or a completed review summary.",
     "Respond by proposing an updated tool call with a concise reason before making changes again.",
   ]
     .filter((line): line is string => Boolean(line))

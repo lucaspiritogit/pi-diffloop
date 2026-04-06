@@ -156,6 +156,8 @@ describe("buildSteeringInstruction", () => {
 				"Do not execute the previously proposed edit for src/file.ts.",
 				"Revise the edit proposal for src/file.ts based on this developer feedback: preserve comments and change only the targeted branch",
 				"Previous rationale: Fix the bug",
+				"Keep the review flow going by replying with an updated edit tool call for src/file.ts.",
+				"Do not end with a normal text response or a completed review summary.",
 				"Respond by proposing an updated tool call with a concise reason before making changes again.",
 			].join("\n"),
 		);
@@ -315,9 +317,11 @@ describe("reviewChanges", () => {
 					"Do not execute the previously proposed edit for src/file.ts.",
 					"Revise the edit proposal for src/file.ts based on this developer feedback: preserve comments and keep the fallback path unchanged",
 					"Previous rationale: Tighten the branch condition",
+					"Keep the review flow going by replying with an updated edit tool call for src/file.ts.",
+					"Do not end with a normal text response or a completed review summary.",
 					"Respond by proposing an updated tool call with a concise reason before making changes again.",
 				].join("\n"),
-				options: undefined,
+				options: { deliverAs: "steer" },
 			},
 		]);
 	});

@@ -1,10 +1,8 @@
 # diffloop
 
-`diffloop` is a Pi extension that puts every `edit` and `write` proposal through a human review loop before the tool executes.
+`diffloop` is a Pi extension that slows down the agentic coding workflow on purpose by presenting each code change to the developer, with a reason attached to it.
 
 ![image](./assets/image.png)
-
-It is designed for cases where you want to inspect file changes, understand why the agent is making them, and either approve, steer, revise, or deny the proposal.
 
 ## What it does
 
@@ -13,83 +11,46 @@ This extension intercepts Pi `edit` and `write` tool calls and replaces the defa
 For each proposed file change, diffloop:
 
 - requires the agent to include a `reason`
-- normalizes `@path` shorthand to `path`
 - shows a diff-oriented preview before execution
-- validates `edit` blocks against Pi's native edit semantics
 - lets you:
   - **approve** the change
-  - **steer** the change with inline feedback
+  - **steer** the change with an inline prompt
   - **edit** the proposal before execution
   - **deny** the change
 
 ## Why use it
 
-Diffloop is useful when you want:
+When working with coding agents, I kept running into two extremes:
 
-- human approval for every file mutation
-- stronger explanations for why a change is being proposed
-- a safer workflow for broad or high-risk agent edits
-- a fast way to steer proposals without leaving the review view
-- visibility into whether an `edit` call will actually match the current file
+- I write a long markdown file full of rules, conventions, and constraints, hoping the agent will stay aligned.
+- I prompt for a bugfix or feature and wait for the result, only to receive a large batch of changes all at once.
+
+Both approaches can work, but they often come with the same problem: **context loss**.
+
+The agent may go further than expected, touch more files than intended, or make reasonable local decisions that drift away from what you had in mind. By the time it returns, you are no longer reviewing a small decision, you are reconstructing a chain of reasoning that its not your own.
+
+That is the problem diffloop is "meant" to solve.
+
+It intentionally slows the workflow down so you can stay close to the agents decisions, review changes as they are proposed, and understand both **what** is changing and **why** before the change is applied.
+
+### A note on usage
+
+diffloop is still an experiment for me, and Im grateful to Pi for providing such solid tools to explore ideas like this.
+
+That said, constant review can become its own kind of fatigue. If every step requires approval, there is always the risk of falling into the habit of pressing "Accept" without really reviewing the change.
+
+Im still exploring whether this kind of intentional slowness has a real place in agentic coding workflows, especially for developers who want to stay close to the code without losing context.
+
+Ideas, feedback, and criticism are all welcome 😁
 
 ## Review flow
 
 When the agent proposes an `edit` or `write`:
 
 1. diffloop intercepts the tool call
-2. it blocks the call if `reason` is missing or empty
-3. it builds a preview of the change
-4. it opens a review UI
-5. you choose one of the available actions
-
-### Available actions
-
-#### Approve
-Runs the tool exactly as proposed.
-
-#### Steer
-Keeps the diff preview visible and opens an inline input under the review actions.
-
-Use this when the proposal is close, but you want to redirect it. For example:
-
-- preserve comments
-- keep the fallback path unchanged
-- follow the existing helper pattern
-- avoid changing public behavior
-
-Press:
-
-- `Enter` to send the steering feedback back to the agent
-- `Esc` to close the inline steering input and return to the action buttons
-
-#### Edit
-Lets you modify the proposed content before execution.
-
-- for `write`, you edit the full file content
-- for single-block `edit`, you edit the replacement block directly
-- for multi-block `edit`, you choose which block to revise
-
-#### Deny
-Blocks the tool call.
-
-## Preview behavior
-
-### Write preview
-For `write` proposals, diffloop shows:
-
-- whether the file will be created or overwritten
-- file size and line count
-- a unified diff against the current file contents
-
-### Edit preview
-For `edit` proposals, diffloop:
-
-- normalizes and filters edit blocks
-- validates each block with Pi's native edit implementation
-- shows warnings for blocks that are not found, not unique, or otherwise invalid
-- renders a unified diff of the resulting file when preview validation succeeds
-
-This means the review UI does more than show the requested replacement text: it tries to show what Pi will actually do.
+2. it builds a preview of the change
+3. it opens a review UI
+4. you choose one of the available actions
 
 ## Agent prompt behavior
 
