@@ -5,11 +5,13 @@
   "description": "Human-in-the-loop review for Pi edit/write tool calls",
   "scripts": {
     "build": "rm -rf dist && bunx tsc -p tsconfig.json",
+    "prepack": "bun run build",
     "typecheck": "bunx tsc -p tsconfig.json --noEmit",
     "test": "bun test",
     "check": "bun run build && bun run typecheck && bun run test",
     "release:dry": "bun run check && bun publish --dry-run",
-    "release": "npm version patch && bun run check && bun publish --access public"
+    "release": "npm version patch && bun run check && bun publish --access public",
+    "release:patch": "npm version patch && npm publish --access public"
   },
   "files": [
     "dist",

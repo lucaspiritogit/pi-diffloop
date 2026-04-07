@@ -84,5 +84,5 @@ bun test
 ### Type-check
 
 ```bash
-bun run lint
+bun run type-check
 ```
