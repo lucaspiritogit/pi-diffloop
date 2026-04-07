@@ -11,7 +11,7 @@ This extension intercepts Pi `edit` and `write` tool calls and replaces the defa
 For each proposed file change, diffloop:
 
 - requires the agent to include a `reason`
-- shows a diff-oriented preview before execution
+- shows a preview before execution
 - lets you:
   - **approve** the change
   - **steer** the change with an inline prompt

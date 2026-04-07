@@ -37,7 +37,7 @@ const EditParams = Type.Object(
   {
     ...nativeEditTool.parameters.properties,
     reason: Type.String({
-      description: "One or two sentences explaining why this exact file change is being proposed for human review",
+      description: "In-depth explanation of why this exact file change is being proposed for human review",
     }),
   },
   { additionalProperties: false },
@@ -47,7 +47,7 @@ const WriteParams = Type.Object(
   {
     ...nativeWriteTool.parameters.properties,
     reason: Type.String({
-      description: "One or two sentences explaining why this file should be created or overwritten for human review",
+      description: "In-depth explanation of why this file should be created or overwritten for human review",
     }),
   },
   { additionalProperties: false },
@@ -173,8 +173,6 @@ export default function reviewChanges(pi: ExtensionAPI) {
       "- describe behavior impact and intended usage",
       "- keep the rationale concrete, scoped, and file-specific",
     ].join("\n"),
-    promptSnippet:
-      "Use write for new files or full rewrites. Include a specific `reason` tied to repository patterns, the file's role, and the expected behavior impact.",
     promptGuidelines: [
       ...(nativeWriteTool.promptGuidelines ?? []),
       "For every write call, include a specific `reason` that explains what the file is for, why it is needed, and what behavior it enables or changes.",
@@ -245,8 +243,8 @@ export default function reviewChanges(pi: ExtensionAPI) {
 
       const updated = await editProposal(ctx, event.toolName, event.input as WriteInput | EditInput);
       if (!updated) {
-				ctx.ui.notify("Edit cancelled.", "info");
-				continue;
+        ctx.ui.notify("Edit cancelled.", "info");
+        continue;
       }
       replaceObject(event.input as Record<string, unknown>, updated as Record<string, unknown>);
     }
@@ -271,18 +269,16 @@ async function buildReviewData(
   if (toolName === "write") {
     const writeInput = input as WriteInput;
     const contentLines = writeInput.content.split("\n").length;
-    const diff = buildUnifiedDiffPreview(existingContent ?? "", writeInput.content, {
-      beforeLabel: existingContent === undefined ? "/dev/null" : `${path} (current)`,
-      afterLabel: path,
-      contextLines: 3,
-    });
+    const nativeWritePreview = await runNativeWritePreview(ctx.cwd, path, writeInput.content);
+
     const summary = [
       existingContent === undefined ? "Operation: create new file" : "Operation: overwrite existing file",
       `Size: ${writeInput.content.length} characters across ${contentLines} lines`,
-      diff.hasChanges
-        ? `Diff: +${diff.additions} / -${diff.removals} across ${Math.max(1, diff.hunks)} hunk(s)`
-        : "Diff: no textual changes",
     ];
+
+    const warningLines = nativeWritePreview.ok
+      ? []
+      : [{ kind: "warning" as const, text: `! ${nativeWritePreview.error}` }];
 
     return {
       toolName,
@@ -291,8 +287,8 @@ async function buildReviewData(
       summary,
       changes: [
         {
-          title: existingContent === undefined ? "New file diff" : "Unified diff against current file",
-          lines: diff.lines,
+          title: existingContent === undefined ? "New file content preview" : "Replacement content preview",
+          lines: [...warningLines, ...buildWriteContentPreview(writeInput.content)],
         },
       ],
     };
@@ -329,7 +325,8 @@ async function buildReviewData(
     ...blockStatuses.flatMap((status) => buildNativePreviewWarnings(status)),
     ...(!preview.ok ? [{ kind: "warning" as const, text: `! ${preview.error}` }] : []),
   ];
-  const diff = preview.ok && typeof preview.diff === "string" ? buildPreviewFromNativeEditDiff(preview.diff) : undefined;
+  const diff =
+    preview.ok && typeof preview.diff === "string" ? buildPreviewFromNativeEditDiff(preview.diff) : undefined;
 
   summary.push(`Preview match: ${validBlocks}/${editInput.edits.length} block(s) accepted by Pi's native edit tool`);
   if (invalidBlocks) {
@@ -344,12 +341,6 @@ async function buildReviewData(
     } else {
       summary.push("Diff: no textual changes");
     }
-  } else {
-    summary.push(
-      preview.ok
-        ? "Diff: unavailable because Pi did not return native edit diff details during preview"
-        : "Diff: unavailable because Pi rejected the edit proposal during preview validation",
-    );
   }
 
   return {
@@ -367,242 +358,248 @@ async function buildReviewData(
 }
 
 async function handleReviewAction(ctx: ExtensionContext, review: ReviewData): Promise<ReviewDecision> {
-  return ctx.ui.custom<ReviewDecision>((tui, theme, _keybindings, done) => {
-    const actions: ReviewAction[] = ["approve", "steer", "edit", "deny"];
-    let selected = 0;
-    let steeringMode = false;
-    let steeringError: string | undefined;
-    let focused = false;
-    let previewScrollOffset = 0;
-    let lastContentLineCount = 0;
-    let lastVisibleContentRows = 1;
-    const steeringInput = new Input();
+  return ctx.ui.custom<ReviewDecision>(
+    (tui, theme, _keybindings, done) => {
+      const actions: ReviewAction[] = ["approve", "steer", "edit", "deny"];
+      let selected = 0;
+      let steeringMode = false;
+      let steeringError: string | undefined;
+      let focused = false;
+      let previewScrollOffset = 0;
+      let lastContentLineCount = 0;
+      let lastVisibleContentRows = 1;
+      const steeringInput = new Input();
 
-    const actionLabel = (action: ReviewAction) => {
-      if (actions[selected] === action) {
-        return theme.bg("selectedBg", theme.fg("text", action));
-      }
-      if (action === "approve") return theme.fg("success", action);
-      if (action === "steer") return theme.fg("warning", action);
-      if (action === "edit") return theme.fg("accent", action);
-      return theme.fg("error", action);
-    };
+      const actionLabel = (action: ReviewAction) => {
+        if (actions[selected] === action) {
+          return theme.bg("selectedBg", theme.fg("text", action));
+        }
+        if (action === "approve") return theme.fg("success", action);
+        if (action === "steer") return theme.fg("warning", action);
+        if (action === "edit") return theme.fg("accent", action);
+        return theme.fg("error", action);
+      };
 
-    const setSteeringMode = (enabled: boolean) => {
-      steeringMode = enabled;
-      steeringError = undefined;
-      if (!enabled) {
-        steeringInput.setValue("");
-      }
-      steeringInput.focused = enabled && focused;
-    };
+      const setSteeringMode = (enabled: boolean) => {
+        steeringMode = enabled;
+        steeringError = undefined;
+        if (!enabled) {
+          steeringInput.setValue("");
+        }
+        steeringInput.focused = enabled && focused;
+      };
 
-    const clampPreviewScroll = () => {
-      const maxOffset = Math.max(0, lastContentLineCount - lastVisibleContentRows);
-      previewScrollOffset = Math.max(0, Math.min(previewScrollOffset, maxOffset));
-      return maxOffset;
-    };
+      const clampPreviewScroll = () => {
+        const maxOffset = Math.max(0, lastContentLineCount - lastVisibleContentRows);
+        previewScrollOffset = Math.max(0, Math.min(previewScrollOffset, maxOffset));
+        return maxOffset;
+      };
 
-    const scrollPreview = (delta: number) => {
-      const maxOffset = clampPreviewScroll();
-      if (maxOffset === 0) return false;
+      const scrollPreview = (delta: number) => {
+        const maxOffset = clampPreviewScroll();
+        if (maxOffset === 0) return false;
 
-      const nextOffset = Math.max(0, Math.min(previewScrollOffset + delta, maxOffset));
-      if (nextOffset === previewScrollOffset) return false;
+        const nextOffset = Math.max(0, Math.min(previewScrollOffset + delta, maxOffset));
+        if (nextOffset === previewScrollOffset) return false;
 
-      previewScrollOffset = nextOffset;
-      return true;
-    };
+        previewScrollOffset = nextOffset;
+        return true;
+      };
 
-    steeringInput.onSubmit = (value: string) => {
-      const steering = value.trim();
-      if (!steering) {
-        steeringError = "Enter steering instructions or press Esc to cancel.";
+      steeringInput.onSubmit = (value: string) => {
+        const steering = value.trim();
+        if (!steering) {
+          steeringError = "Enter steering instructions or press Esc to cancel.";
+          tui.requestRender();
+          return;
+        }
+        done({ action: "steer", steering });
+      };
+
+      steeringInput.onEscape = () => {
+        setSteeringMode(false);
         tui.requestRender();
-        return;
-      }
-      done({ action: "steer", steering });
-    };
+      };
 
-    steeringInput.onEscape = () => {
-      setSteeringMode(false);
-      tui.requestRender();
-    };
+      const buildHeaderLines = (width: number) => {
+        const headerLines: string[] = [];
+        const innerWidth = Math.max(20, width - 2);
+        const divider = theme.fg("borderAccent", "─".repeat(innerWidth));
 
-    const buildHeaderLines = (width: number) => {
-      const headerLines: string[] = [];
-      const innerWidth = Math.max(20, width - 2);
-      const divider = theme.fg("borderAccent", "─".repeat(innerWidth));
+        pushLine(headerLines, width, divider);
+        pushWrappedLine(headerLines, width, theme.fg("dim", theme.bold(`Review ${review.toolName}: ${review.path}`)));
+        pushWrappedLine(headerLines, width, theme.fg("accent", `Why: ${review.reason}`));
+        headerLines.push("");
 
-      pushLine(headerLines, width, divider);
-      pushWrappedLine(headerLines, width, theme.fg("dim", theme.bold(`Review ${review.toolName}: ${review.path}`)));
-      pushWrappedLine(headerLines, width, theme.fg("accent", `Why: ${review.reason}`));
-      headerLines.push("");
+        return { headerLines, divider };
+      };
 
-      return { headerLines, divider };
-    };
+      return {
+        get focused() {
+          return focused;
+        },
 
-    return {
-      get focused() {
-        return focused;
-      },
+        set focused(value: boolean) {
+          focused = value;
+          steeringInput.focused = steeringMode && value;
+        },
 
-      set focused(value: boolean) {
-        focused = value;
-        steeringInput.focused = steeringMode && value;
-      },
-
-      handleInput(data: string) {
-        if (steeringMode) {
-          steeringInput.handleInput(data);
-          tui.requestRender();
-          return;
-        }
-
-        if (matchesKey(data, Key.left) || matchesKey(data, Key.shift("tab"))) {
-          selected = (selected - 1 + actions.length) % actions.length;
-          tui.requestRender();
-          return;
-        }
-
-        if (matchesKey(data, Key.right) || matchesKey(data, Key.tab)) {
-          selected = (selected + 1) % actions.length;
-          tui.requestRender();
-          return;
-        }
-
-        if (matchesKey(data, Key.up) || matchesKey(data, Key.shift("up")) || data === "k") {
-          if (scrollPreview(-1)) tui.requestRender();
-          return;
-        }
-
-        if (matchesKey(data, Key.down) || matchesKey(data, Key.shift("down")) || data === "j") {
-          if (scrollPreview(1)) tui.requestRender();
-          return;
-        }
-
-        if (matchesKey(data, Key.pageUp)) {
-          if (scrollPreview(-Math.max(1, lastVisibleContentRows - 1))) tui.requestRender();
-          return;
-        }
-
-        if (matchesKey(data, Key.pageDown)) {
-          if (scrollPreview(Math.max(1, lastVisibleContentRows - 1))) tui.requestRender();
-          return;
-        }
-
-        if (matchesKey(data, Key.home)) {
-          if (previewScrollOffset !== 0) {
-            previewScrollOffset = 0;
-            tui.requestRender();
-          }
-          return;
-        }
-
-        if (matchesKey(data, Key.end)) {
-          const maxOffset = clampPreviewScroll();
-          if (previewScrollOffset !== maxOffset) {
-            previewScrollOffset = maxOffset;
-            tui.requestRender();
-          }
-          return;
-        }
-
-        if (matchesKey(data, Key.enter)) {
-          const action = actions[selected];
-          if (action === "steer") {
-            setSteeringMode(true);
+        handleInput(data: string) {
+          if (steeringMode) {
+            steeringInput.handleInput(data);
             tui.requestRender();
             return;
           }
 
-          done(action);
-          return;
-        }
+          if (matchesKey(data, Key.left) || matchesKey(data, Key.shift("tab"))) {
+            selected = (selected - 1 + actions.length) % actions.length;
+            tui.requestRender();
+            return;
+          }
 
-        if (matchesKey(data, Key.escape)) {
-          done("deny");
-        }
-      },
+          if (matchesKey(data, Key.right) || matchesKey(data, Key.tab)) {
+            selected = (selected + 1) % actions.length;
+            tui.requestRender();
+            return;
+          }
 
-      invalidate() {
-        steeringInput.invalidate();
-      },
+          if (matchesKey(data, Key.up) || matchesKey(data, Key.shift("up")) || data === "k") {
+            if (scrollPreview(-1)) tui.requestRender();
+            return;
+          }
 
-      render(width: number) {
-        const { headerLines, divider } = buildHeaderLines(width);
-        const bodyLines = buildReviewBodyLines(review, width, theme);
-        const contentLines = [...headerLines, ...bodyLines];
+          if (matchesKey(data, Key.down) || matchesKey(data, Key.shift("down")) || data === "j") {
+            if (scrollPreview(1)) tui.requestRender();
+            return;
+          }
 
-        const buildFooterLines = (hint: string) => {
-          const lines: string[] = [];
-          pushLine(
-            lines,
-            width,
-            `${actionLabel("approve")} ${actionLabel("steer")}  ${actionLabel("edit")}  ${actionLabel("deny")}`,
-          );
-          pushWrappedLine(lines, width, theme.fg("dim", hint));
-          if (steeringMode) {
-            lines.push("");
-            pushWrappedLine(lines, width, theme.fg("warning", theme.bold("Steering feedback")));
-            pushWrappedLine(
+          if (matchesKey(data, Key.pageUp)) {
+            if (scrollPreview(-Math.max(1, lastVisibleContentRows - 1))) tui.requestRender();
+            return;
+          }
+
+          if (matchesKey(data, Key.pageDown)) {
+            if (scrollPreview(Math.max(1, lastVisibleContentRows - 1))) tui.requestRender();
+            return;
+          }
+
+          if (matchesKey(data, Key.home)) {
+            if (previewScrollOffset !== 0) {
+              previewScrollOffset = 0;
+              tui.requestRender();
+            }
+            return;
+          }
+
+          if (matchesKey(data, Key.end)) {
+            const maxOffset = clampPreviewScroll();
+            if (previewScrollOffset !== maxOffset) {
+              previewScrollOffset = maxOffset;
+              tui.requestRender();
+            }
+            return;
+          }
+
+          if (matchesKey(data, Key.enter)) {
+            const action = actions[selected];
+            if (action === "steer") {
+              setSteeringMode(true);
+              tui.requestRender();
+              return;
+            }
+
+            done(action);
+            return;
+          }
+
+          if (matchesKey(data, Key.escape)) {
+            done("deny");
+          }
+        },
+
+        invalidate() {
+          steeringInput.invalidate();
+        },
+
+        render(width: number) {
+          const { headerLines, divider } = buildHeaderLines(width);
+          const bodyLines = buildReviewBodyLines(review, width, theme);
+          const contentLines = [...headerLines, ...bodyLines];
+
+          const buildFooterLines = (hint: string) => {
+            const lines: string[] = [];
+            pushLine(
               lines,
               width,
-              theme.fg("dim", "Describe what should change, what should stay the same, and any behavior constraints."),
+              `${actionLabel("approve")} ${actionLabel("steer")}  ${actionLabel("edit")}  ${actionLabel("deny")}`,
             );
-            lines.push(...steeringInput.render(width));
-            if (steeringError) {
-              pushWrappedLine(lines, width, theme.fg("warning", steeringError));
+            pushWrappedLine(lines, width, theme.fg("dim", hint));
+            if (steeringMode) {
+              lines.push("");
+              pushWrappedLine(lines, width, theme.fg("warning", theme.bold("Steering feedback")));
+              pushWrappedLine(
+                lines,
+                width,
+                theme.fg(
+                  "dim",
+                  "Describe what should change, what should stay the same, and any behavior constraints.",
+                ),
+              );
+              lines.push(...steeringInput.render(width));
+              if (steeringError) {
+                pushWrappedLine(lines, width, theme.fg("warning", steeringError));
+              }
             }
+            pushLine(lines, width, divider);
+            return lines;
+          };
+
+          let hint = steeringMode
+            ? "Type steering feedback below • Enter send • Esc cancel"
+            : "←/→ choose • ↑/↓ or j/k scroll • Enter confirm • Esc deny";
+
+          let footerLines = buildFooterLines(hint);
+
+          for (let i = 0; i < 2; i++) {
+            const availableRows = Math.max(1, tui.terminal.rows - footerLines.length);
+            lastContentLineCount = contentLines.length;
+            lastVisibleContentRows = availableRows;
+            const maxOffset = clampPreviewScroll();
+            const isScrollable = maxOffset > 0;
+            const visibleStart = previewScrollOffset + 1;
+            const visibleEnd = Math.min(contentLines.length, previewScrollOffset + availableRows);
+
+            const nextHint = steeringMode
+              ? "Type steering feedback below • Enter send • Esc cancel"
+              : isScrollable
+                ? `←/→ choose • ↑/↓ or j/k scroll • PgUp/PgDn page • Home/End jump (${visibleStart}-${visibleEnd}/${contentLines.length})`
+                : "←/→ choose • Enter confirm • Esc deny";
+
+            if (nextHint === hint) break;
+            hint = nextHint;
+            footerLines = buildFooterLines(hint);
           }
-          pushLine(lines, width, divider);
-          return lines;
-        };
 
-        let hint = steeringMode
-          ? "Type steering feedback below • Enter send • Esc cancel"
-          : "←/→ choose • ↑/↓ or j/k scroll • Enter confirm • Esc deny";
-
-        let footerLines = buildFooterLines(hint);
-
-        for (let i = 0; i < 2; i++) {
           const availableRows = Math.max(1, tui.terminal.rows - footerLines.length);
           lastContentLineCount = contentLines.length;
           lastVisibleContentRows = availableRows;
-          const maxOffset = clampPreviewScroll();
-          const isScrollable = maxOffset > 0;
-          const visibleStart = previewScrollOffset + 1;
-          const visibleEnd = Math.min(contentLines.length, previewScrollOffset + availableRows);
+          clampPreviewScroll();
 
-          const nextHint = steeringMode
-            ? "Type steering feedback below • Enter send • Esc cancel"
-            : isScrollable
-              ? `←/→ choose • ↑/↓ or j/k scroll • PgUp/PgDn page • Home/End jump (${visibleStart}-${visibleEnd}/${contentLines.length})`
-              : "←/→ choose • Enter confirm • Esc deny";
-
-          if (nextHint === hint) break;
-          hint = nextHint;
-          footerLines = buildFooterLines(hint);
-        }
-
-        const availableRows = Math.max(1, tui.terminal.rows - footerLines.length);
-        lastContentLineCount = contentLines.length;
-        lastVisibleContentRows = availableRows;
-        clampPreviewScroll();
-
-        const visibleContent = contentLines.slice(previewScrollOffset, previewScrollOffset + availableRows);
-        return [...visibleContent, ...footerLines];
-      },
-    };
-  }, {
-    overlay: true,
-    overlayOptions: {
-      anchor: "bottom-center",
-      width: "100%",
-      maxHeight: "100%",
-      margin: 0,
+          const visibleContent = contentLines.slice(previewScrollOffset, previewScrollOffset + availableRows);
+          return [...visibleContent, ...footerLines];
+        },
+      };
     },
-  });
+    {
+      overlay: true,
+      overlayOptions: {
+        anchor: "bottom-center",
+        width: "100%",
+        maxHeight: "100%",
+        margin: 0,
+      },
+    },
+  );
 }
 
 export function buildSteeringInstruction(
@@ -709,7 +706,8 @@ async function editProposal(
   } catch (error: any) {
     if (error?.code !== "ENOENT") throw error;
   }
-  const blockStatuses = existingContent !== undefined ? await getNativeEditBlockStatuses(ctx.cwd, current.path, current.edits) : undefined;
+  const blockStatuses =
+    existingContent !== undefined ? await getNativeEditBlockStatuses(ctx.cwd, current.path, current.edits) : undefined;
   const options = current.edits.map((edit, index) => describeEditBlockOption(edit, index, blockStatuses?.[index]));
   const choice = await ctx.ui.select(`Choose a proposed block to edit for ${current.path}`, options);
   if (choice === undefined) return undefined;
@@ -718,7 +716,10 @@ async function editProposal(
   if (selectedIndex < 0) return undefined;
 
   const selectedEdit = current.edits[selectedIndex]!;
-  const content = await ctx.ui.editor(`Edit proposed block ${selectedIndex + 1} for ${current.path}`, selectedEdit.newText);
+  const content = await ctx.ui.editor(
+    `Edit proposed block ${selectedIndex + 1} for ${current.path}`,
+    selectedEdit.newText,
+  );
   if (content === undefined) return undefined;
 
   return normalizeEditInput({
@@ -730,9 +731,7 @@ async function editProposal(
   });
 }
 
-type NativeEditPreviewResult =
-  | { ok: true; diff?: string }
-  | { ok: false; error: string; diff?: string };
+type NativeEditPreviewResult = { ok: true; diff?: string } | { ok: false; error: string; diff?: string };
 
 type NativeEditBlockStatus = {
   index: number;
@@ -757,11 +756,48 @@ async function runNativeEditPreview(cwd: string, path: string, edits: EditBlock[
   });
 
   try {
-    const result = await nativeEdit.execute("diffloop-native-preview", { path, edits }, undefined, undefined, undefined as any);
+    const result = await nativeEdit.execute(
+      "diffloop-native-preview",
+      { path, edits },
+      undefined,
+      undefined,
+      undefined as any,
+    );
     return {
       ok: true,
       diff: result.details?.diff,
     };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+type NativeWritePreviewResult = { ok: true } | { ok: false; error: string };
+
+async function runNativeWritePreview(cwd: string, path: string, content: string): Promise<NativeWritePreviewResult> {
+  const nativeWrite = createWriteToolDefinition(cwd, {
+    operations: {
+      async mkdir(_dir: string) {
+        // Preview only; directory creation is skipped.
+      },
+      async writeFile(_absolutePath: string, _content: string) {
+        // Preview only; disk writes are intentionally skipped.
+      },
+    },
+  });
+
+  try {
+    await nativeWrite.execute(
+      "diffloop-native-write-preview",
+      { path, content },
+      undefined,
+      undefined,
+      undefined as any,
+    );
+    return { ok: true };
   } catch (error) {
     return {
       ok: false,
@@ -818,7 +854,26 @@ function buildPreviewFromNativeEditDiff(diff: string) {
   };
 }
 
-async function getNativeEditBlockStatuses(cwd: string, path: string, edits: EditBlock[]): Promise<NativeEditBlockStatus[]> {
+function buildWriteContentPreview(content: string, maxLines = 200): DiffPreviewLine[] {
+  if (content.length === 0) {
+    return [{ kind: "meta", text: "(empty file)" }];
+  }
+
+  const lines = content.split("\n");
+  const previewLines: DiffPreviewLine[] = lines.slice(0, maxLines).map((line) => ({ kind: "add", text: `+${line}` }));
+
+  if (lines.length > maxLines) {
+    previewLines.push({ kind: "meta", text: `... (${lines.length - maxLines} more line(s) truncated)` });
+  }
+
+  return previewLines;
+}
+
+async function getNativeEditBlockStatuses(
+  cwd: string,
+  path: string,
+  edits: EditBlock[],
+): Promise<NativeEditBlockStatus[]> {
   return Promise.all(
     edits.map(async (edit, index) => {
       const preview = await runNativeEditPreview(cwd, path, [edit]);
@@ -926,4 +981,3 @@ function displayDiffloopStatus(ctx: ExtensionContext, enabled: boolean, announce
     ctx.ui.notify(`Diffloop ${enabled ? "on" : "off"}`, enabled ? "warning" : "info");
   }
 }
-

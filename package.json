@@ -29,9 +29,7 @@
   "author": "",
   "license": "MIT",
   "type": "commonjs",
-  "dependencies": {
-    "diff": "8.0.4"
-  },
+  "dependencies": {},
   "pi": {
     "extensions": [
       "./dist/index.js"
