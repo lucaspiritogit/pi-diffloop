@@ -31,7 +31,9 @@ function createReviewHarness() {
 
 	const toolCall = handlers.get("tool_call");
 	if (!toolCall) throw new Error("tool_call handler was not registered");
-	return { toolCall, sentMessages, sentHiddenMessages };
+	const input = handlers.get("input");
+	if (!input) throw new Error("input handler was not registered");
+	return { toolCall, input, sentMessages, sentHiddenMessages };
 }
 
 function registerToolCallHandler() {
@@ -312,20 +314,15 @@ describe("reviewChanges", () => {
 
 		expect(result).toEqual({
 			block: true,
-			reason: "Developer steered edit for src/file.ts",
+			reason: [
+				"Do not execute the previously proposed edit for src/file.ts.",
+				"Developer feedback to apply: preserve comments and keep the fallback path unchanged",
+				"Previous rationale: Tighten the branch condition",
+				"First, read src/file.ts to refresh current file state before deciding what to change.",
+				"After reading, choose the appropriate next step (edit or write) and continue only if a change is still needed.",
+			].join("\n"),
 		});
-		expect(sentMessages).toEqual([
-			{
-				message: [
-					"Do not execute the previously proposed edit for src/file.ts.",
-					"Developer feedback to apply: preserve comments and keep the fallback path unchanged",
-					"Previous rationale: Tighten the branch condition",
-					"First, read src/file.ts to refresh current file state before deciding what to change.",
-					"After reading, choose the appropriate next step (edit or write) and continue only if a change is still needed.",
-				].join("\n"),
-				options: { deliverAs: "steer" },
-			},
-		]);
+		expect(sentMessages).toEqual([]);
 	});
 
 	test("requires a read call after steering before allowing a new edit/write", async () => {
@@ -382,7 +379,95 @@ describe("reviewChanges", () => {
 		expect(readResult).toBeUndefined();
 	});
 
-	test("blocks approve for invalid edit previews and auto-steers read-first replanning", async () => {
+	test("deny aborts current execution and blocks tool calls until a new user input arrives", async () => {
+		const { toolCall, input } = createReviewHarness();
+		let aborted = false;
+
+		const denied = await toolCall(
+			{
+				toolName: "edit",
+				input: {
+					path: "@src/file.ts",
+					reason: "Deny this",
+					edits: [{ oldText: "old", newText: "new" }],
+				},
+			},
+			{
+				hasUI: true,
+				cwd: process.cwd(),
+				abort() {
+					aborted = true;
+				},
+				isIdle: () => true,
+				ui: {
+					custom: async () => "deny",
+					notify() {},
+				},
+			} as any,
+		);
+
+		expect(aborted).toBe(true);
+		expect(denied).toEqual(expect.objectContaining({ block: true }));
+		expect((denied as any).reason).toContain("Developer denied the proposed change");
+
+		const blocked = await toolCall(
+			{
+				toolName: "write",
+				input: {
+					path: "@notes.txt",
+					reason: "Should not run",
+					content: "x",
+				},
+			},
+			{
+				hasUI: true,
+				cwd: process.cwd(),
+				ui: { notify() {} },
+			} as any,
+		);
+
+		expect(blocked).toEqual({
+			block: true,
+			reason: "Developer denied the previous change. Stop execution and wait for a new user prompt before using tools again.",
+		});
+
+		await input(
+			{
+				type: "input",
+				text: "try again",
+				source: "interactive",
+			},
+			{
+				hasUI: true,
+				cwd: process.cwd(),
+				ui: { notify() {} },
+			} as any,
+		);
+
+		const afterInput = await toolCall(
+			{
+				toolName: "write",
+				input: {
+					path: "@notes.txt",
+					reason: "Now allowed",
+					content: "x",
+				},
+			},
+			{
+				hasUI: true,
+				cwd: process.cwd(),
+				isIdle: () => true,
+				ui: {
+					custom: async () => "approve",
+					notify() {},
+				},
+			} as any,
+		);
+
+		expect(afterInput).toBeUndefined();
+	});
+
+	test("blocks approve for invalid edit previews and returns read-first replanning guidance", async () => {
 		const { toolCall, sentMessages } = createReviewHarness();
 		const directory = await mkdtemp(join(tmpdir(), "diffloop-auto-steer-"));
 
@@ -410,16 +495,13 @@ describe("reviewChanges", () => {
 				} as any,
 			);
 
-			expect(result).toEqual({
-				block: true,
-				reason: "Blocked edit approval for src/file.ts: preview validation failed and replanning was requested.",
-			});
-			expect(sentMessages[0]?.options).toEqual({ deliverAs: "steer" });
-			expect(sentMessages[0]?.message).toContain("Do not execute the previously proposed edit for src/file.ts.");
-			expect(sentMessages[0]?.message).toContain("Validation issue:");
-			expect(sentMessages[0]?.message).toContain(
+			expect(result).toEqual(expect.objectContaining({ block: true }));
+			expect((result as any).reason).toContain("Do not execute the previously proposed edit for src/file.ts.");
+			expect((result as any).reason).toContain("Validation issue:");
+			expect((result as any).reason).toContain(
 				"First, read src/file.ts to refresh current file state before deciding what to change.",
 			);
+			expect(sentMessages).toEqual([]);
 
 			const blocked = await toolCall(
 				{
@@ -477,7 +559,7 @@ describe("reviewChanges", () => {
 		}
 	});
 
-	test("sends edited write proposals back to the agent for read-first replanning", async () => {
+	test("returns edited write proposals as block reason guidance for read-first replanning", async () => {
 		const { toolCall, sentHiddenMessages } = createReviewHarness();
 		const customResults = ["edit"];
 		const event = {
@@ -500,17 +582,14 @@ describe("reviewChanges", () => {
 			},
 		} as any);
 
-		expect(result).toEqual({
-			block: true,
-			reason: "Developer edited write for notes.txt and requested replanning",
-		});
-		expect(sentHiddenMessages[0]?.options).toEqual({ deliverAs: "steer" });
-		expect((sentHiddenMessages[0]?.message as any)?.display).toBe(false);
-		expect((sentHiddenMessages[0]?.message as any)?.content).toContain("The developer edited the proposal for notes.txt");
-		expect((sentHiddenMessages[0]?.message as any)?.content).toContain("First, read notes.txt to refresh current file state.");
+		expect(result).toEqual(expect.objectContaining({ block: true }));
+		expect((result as any).reason).toContain("The developer edited the proposal for notes.txt");
+		expect((result as any).reason).toContain("regenerate a fresh proposal without reusing the prior payload verbatim");
+		expect((result as any).reason).toContain("First, read notes.txt to refresh current file state.");
+		expect(sentHiddenMessages).toEqual([]);
 	});
 
-	test("sends edited edit proposals back to the agent for read-first replanning", async () => {
+	test("returns edited edit proposals as block reason guidance for read-first replanning", async () => {
 		const { toolCall, sentHiddenMessages } = createReviewHarness();
 		const customResults = ["edit"];
 		const directory = await mkdtemp(join(tmpdir(), "diffloop-edit-proposal-"));
@@ -539,13 +618,10 @@ describe("reviewChanges", () => {
 				},
 			} as any);
 
-			expect(result).toEqual({
-				block: true,
-				reason: "Developer edited edit for src/file.ts and requested replanning",
-			});
-			expect((sentHiddenMessages[0]?.message as any)?.display).toBe(false);
-			expect((sentHiddenMessages[0]?.message as any)?.content).toContain("The developer edited the proposal for src/file.ts");
-			expect((sentHiddenMessages[0]?.message as any)?.content).toContain("\"newText\": \"if (newer)\"");
+			expect(result).toEqual(expect.objectContaining({ block: true }));
+			expect((result as any).reason).toContain("The developer edited the proposal for src/file.ts");
+			expect((result as any).reason).not.toContain("\"newText\":\"if (newer)\"");
+			expect(sentHiddenMessages).toEqual([]);
 		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}

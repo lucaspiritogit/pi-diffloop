@@ -117,6 +117,7 @@ export function normalizeWriteArguments(args: any) {
 export default function reviewChanges(pi: ExtensionAPI) {
   let enabled = true;
   let pendingReadPath: string | undefined;
+  let denyHold = false;
 
   pi.registerCommand("diffloop", {
     description: "Set diffloop on, off, toggle it, or show the current status",
@@ -139,6 +140,17 @@ export default function reviewChanges(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     displayDiffloopStatus(ctx, enabled);
+  });
+
+  pi.on("input", async (event, ctx) => {
+    if (!denyHold) return;
+    if (event.source === "extension") return;
+
+    denyHold = false;
+    pendingReadPath = undefined;
+    if (ctx.hasUI) {
+      ctx.ui.notify("Deny lock cleared. Reviewing can continue on the new prompt.", "info");
+    }
   });
 
   pi.registerTool({
@@ -230,6 +242,13 @@ export default function reviewChanges(pi: ExtensionAPI) {
     }
 
     while (true) {
+      if (denyHold) {
+        return {
+          block: true,
+          reason: "Developer denied the previous change. Stop execution and wait for a new user prompt before using tools again.",
+        };
+      }
+
       if (typeof event.input.path === "string") {
         event.input.path = normalizePath(event.input.path);
       }
@@ -257,13 +276,10 @@ export default function reviewChanges(pi: ExtensionAPI) {
       if (action === "approve") {
         if (review.editPreviewValidation && !review.editPreviewValidation.canApprove) {
           pendingReadPath = review.path;
-          pi.sendUserMessage(buildBlockedEditApprovalInstruction(review.path, input as EditInput, review), {
-            deliverAs: "steer",
-          });
-          ctx.ui.notify(`Approval blocked for edit ${review.path}; automatic steering sent.`, "warning");
+          ctx.ui.notify(`Approval blocked for edit ${review.path}; automatic replanning guidance applied.`, "warning");
           return {
             block: true,
-            reason: `Blocked edit approval for ${review.path}: preview validation failed and replanning was requested.`,
+            reason: buildBlockedEditApprovalInstruction(review.path, input as EditInput, review),
           };
         }
 
@@ -272,7 +288,15 @@ export default function reviewChanges(pi: ExtensionAPI) {
       }
 
       if (action === "deny") {
-        return { block: true, reason: `Developer denied ${event.toolName} for ${review.path}` };
+        denyHold = true;
+        pendingReadPath = undefined;
+        ctx.abort();
+        ctx.ui.notify(`Denied ${event.toolName} for ${review.path}. Agent stopped; send a new prompt to continue.`, "warning");
+        return {
+          block: true,
+          reason:
+            "Developer denied the proposed change. Stop now and do not continue this plan. Wait for a new user prompt before attempting further edits or writes.",
+        };
       }
 
       if (typeof action === "object" && action.action === "steer") {
@@ -283,9 +307,8 @@ export default function reviewChanges(pi: ExtensionAPI) {
         }
 
         pendingReadPath = review.path;
-        pi.sendUserMessage(message, { deliverAs: "steer" });
-        ctx.ui.notify(`Steering sent for ${event.toolName} ${review.path}`, "warning");
-        return { block: true, reason: `Developer steered ${event.toolName} for ${review.path}` };
+        ctx.ui.notify(`Steering captured for ${event.toolName} ${review.path}`, "warning");
+        return { block: true, reason: message };
       }
 
       const updated = await editProposal(ctx, event.toolName, event.input as WriteInput | EditInput);
@@ -295,15 +318,8 @@ export default function reviewChanges(pi: ExtensionAPI) {
       }
 
       pendingReadPath = review.path;
-      pi.sendMessage(
-        {
-          customType: "diffloop-hidden-guidance",
-          content: buildEditedProposalInstruction(event.toolName, review.path, updated),
-          display: false,
-        },
-        { deliverAs: "steer" },
-      );
-      return { block: true, reason: `Developer edited ${event.toolName} for ${review.path} and requested replanning` };
+      ctx.ui.notify(`Edited proposal captured for ${event.toolName} ${review.path}`, "warning");
+      return { block: true, reason: buildEditedProposalInstruction(event.toolName, review.path, updated) };
     }
   });
 }
@@ -717,22 +733,17 @@ function buildBlockedEditApprovalInstruction(path: string, input: EditInput, rev
 
 function buildEditedProposalInstruction(toolName: "write" | "edit", path: string, input: WriteInput | EditInput): string {
   const normalizedPath = normalizePath(path);
-  const normalizedInput =
-    toolName === "write"
-      ? {
-          path: normalizePath((input as WriteInput).path),
-          reason: (input as WriteInput).reason.trim(),
-          content: (input as WriteInput).content,
-        }
-      : normalizeEditInput(input as EditInput);
+  const currentReason = typeof input.reason === "string" && input.reason.trim() ? input.reason.trim() : undefined;
 
   return [
     `Do not execute the previously proposed ${toolName} for ${normalizedPath}.`,
-    `The developer edited the proposal for ${normalizedPath}; use the updated intent below as guidance.`,
-    JSON.stringify(normalizedInput, null, 2),
+    `The developer edited the proposal for ${normalizedPath} in review mode; regenerate a fresh proposal without reusing the prior payload verbatim.`,
+    currentReason ? `Previous rationale: ${currentReason}` : undefined,
     `First, read ${normalizedPath} to refresh current file state.`,
     "After reading, decide whether edit or write is the right tool and continue only if a change is still required.",
-  ].join("\n");
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
 }
 
 export function buildReviewBodyLines(
