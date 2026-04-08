@@ -23,6 +23,10 @@ type ReviewData = {
   reason: string;
   summary: string[];
   changes: Array<{ title: string; lines: DiffPreviewLine[] }>;
+  editPreviewValidation?: {
+    canApprove: boolean;
+    errors: string[];
+  };
 };
 
 const DIFFLOOP_REVIEW_STATUS = "diffloop";
@@ -32,6 +36,15 @@ const nativeWriteTool = createWriteToolDefinition(process.cwd());
 type EditBlock = EditToolInput["edits"][number];
 type EditInput = EditToolInput & { reason: string };
 type WriteInput = WriteToolInput & { reason: string };
+
+type NativeEditPreviewResult = { ok: true; diff?: string } | { ok: false; error: string; diff?: string };
+
+type NativeEditBlockStatus = {
+  index: number;
+  ok: boolean;
+  kind?: "notFound" | "notUnique" | "invalid";
+  error?: string;
+};
 
 const EditParams = Type.Object(
   {
@@ -242,6 +255,18 @@ export default function reviewChanges(pi: ExtensionAPI) {
       const action = await handleReviewAction(ctx, review);
 
       if (action === "approve") {
+        if (review.editPreviewValidation && !review.editPreviewValidation.canApprove) {
+          pendingReadPath = review.path;
+          pi.sendUserMessage(buildBlockedEditApprovalInstruction(review.path, input as EditInput, review), {
+            deliverAs: "steer",
+          });
+          ctx.ui.notify(`Approval blocked for edit ${review.path}; automatic steering sent.`, "warning");
+          return {
+            block: true,
+            reason: `Blocked edit approval for ${review.path}: preview validation failed and replanning was requested.`,
+          };
+        }
+
         ctx.ui.notify(`Approved ${event.toolName} ${review.path}`, "info");
         return undefined;
       }
@@ -330,11 +355,16 @@ async function buildReviewData(
   const summary = [`Operation: ${editInput.edits.length} exact replacement block(s)`];
 
   if (existingContent === undefined) {
+    const validationErrors = ["Target file was not found on disk."];
     return {
       toolName,
       path,
       reason,
       summary: [...summary, "Preview warning: target file does not exist on disk"],
+      editPreviewValidation: {
+        canApprove: false,
+        errors: validationErrors,
+      },
       changes: editInput.edits.map((edit, index) => ({
         title: `Edit block ${index + 1}`,
         lines: [
@@ -367,6 +397,13 @@ async function buildReviewData(
   if (!preview.ok) {
     summary.push(`Preview validation: ${preview.error}`);
   }
+
+  const validationErrors = buildEditValidationErrors(blockStatuses, preview.ok ? undefined : preview.error);
+  const canApprove = validationErrors.length === 0;
+  if (!canApprove) {
+    summary.push("Approval guard: invalid native preview; approve will trigger automatic read-first replanning");
+  }
+
   if (diff) {
     if (diff.hasChanges) {
       summary.push(`Diff: +${diff.additions} / -${diff.removals} across ${Math.max(1, diff.hunks)} hunk(s)`);
@@ -380,6 +417,10 @@ async function buildReviewData(
     path,
     reason,
     summary,
+    editPreviewValidation: {
+      canApprove,
+      errors: validationErrors,
+    },
     changes: [
       {
         title: "Unified diff against current file",
@@ -656,6 +697,24 @@ export function buildSteeringInstruction(
     .join("\n");
 }
 
+function buildBlockedEditApprovalInstruction(path: string, input: EditInput, review: ReviewData): string {
+  const normalizedPath = normalizePath(path);
+  const currentReason = typeof input.reason === "string" && input.reason.trim() ? input.reason.trim() : undefined;
+  const validationErrors = review.editPreviewValidation?.errors ?? ["Native preview validation failed."];
+
+  return [
+    `Do not execute the previously proposed edit for ${normalizedPath}.`,
+    "The proposal could not be approved because Pi's native edit preview reported validation failures.",
+    ...validationErrors.map((error) => `Validation issue: ${error}`),
+    currentReason ? `Previous rationale: ${currentReason}` : undefined,
+    `First, read ${normalizedPath} to refresh current file state before deciding what to change.`,
+    `Then propose a new edit with oldText copied exactly from ${normalizedPath}, including whitespace/newlines, and make each block unique with enough surrounding context.`,
+    "If exact replacement remains unreliable, switch to write with the complete updated file content.",
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
+}
+
 function buildEditedProposalInstruction(toolName: "write" | "edit", path: string, input: WriteInput | EditInput): string {
   const normalizedPath = normalizePath(path);
   const normalizedInput =
@@ -781,15 +840,6 @@ async function editProposal(
     ),
   });
 }
-
-type NativeEditPreviewResult = { ok: true; diff?: string } | { ok: false; error: string; diff?: string };
-
-type NativeEditBlockStatus = {
-  index: number;
-  ok: boolean;
-  kind?: "notFound" | "notUnique" | "invalid";
-  error?: string;
-};
 
 async function runNativeEditPreview(cwd: string, path: string, edits: EditBlock[]): Promise<NativeEditPreviewResult> {
   const nativeEdit = createEditToolDefinition(cwd, {
@@ -951,13 +1001,35 @@ function classifyNativeEditError(error: string): NativeEditBlockStatus["kind"] {
   return "invalid";
 }
 
+function buildEditValidationErrors(blockStatuses: NativeEditBlockStatus[], previewError?: string): string[] {
+  const notFound = blockStatuses.filter((status) => !status.ok && status.kind === "notFound").length;
+  const notUnique = blockStatuses.filter((status) => !status.ok && status.kind === "notUnique").length;
+  const invalid = blockStatuses.filter((status) => !status.ok && status.kind === "invalid").length;
+
+  const errors: string[] = [];
+  if (notFound > 0) {
+    errors.push(`${notFound} block(s) did not match the current file content.`);
+  }
+  if (notUnique > 0) {
+    errors.push(`${notUnique} block(s) matched multiple locations; oldText must be unique.`);
+  }
+  if (invalid > 0) {
+    errors.push(`${invalid} block(s) were rejected by native preview validation.`);
+  }
+  if (previewError) {
+    errors.push(previewError);
+  }
+
+  return errors;
+}
+
 function buildNativePreviewWarnings(status: NativeEditBlockStatus): DiffPreviewLine[] {
   if (status.ok) return [];
   if (status.kind === "notFound") {
     return [
       {
         kind: "warning",
-        text: `! Edit block ${status.index + 1} oldText was not found by Pi'.`,
+        text: `! Edit block ${status.index + 1} oldText was not found by Pi's native edit tool.`,
       },
     ];
   }

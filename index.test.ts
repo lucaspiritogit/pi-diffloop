@@ -382,6 +382,101 @@ describe("reviewChanges", () => {
 		expect(readResult).toBeUndefined();
 	});
 
+	test("blocks approve for invalid edit previews and auto-steers read-first replanning", async () => {
+		const { toolCall, sentMessages } = createReviewHarness();
+		const directory = await mkdtemp(join(tmpdir(), "diffloop-auto-steer-"));
+
+		try {
+			await mkdir(join(directory, "src"), { recursive: true });
+			await writeFile(join(directory, "src/file.ts"), "const value = 1;\n");
+
+			const result = await toolCall(
+				{
+					toolName: "edit",
+					input: {
+						path: "@src/file.ts",
+						reason: "Update the declaration",
+						edits: [{ oldText: "const missing = 2;", newText: "const value = 2;" }],
+					},
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					isIdle: () => true,
+					ui: {
+						custom: async () => "approve",
+						notify() {},
+					},
+				} as any,
+			);
+
+			expect(result).toEqual({
+				block: true,
+				reason: "Blocked edit approval for src/file.ts: preview validation failed and replanning was requested.",
+			});
+			expect(sentMessages[0]?.options).toEqual({ deliverAs: "steer" });
+			expect(sentMessages[0]?.message).toContain("Do not execute the previously proposed edit for src/file.ts.");
+			expect(sentMessages[0]?.message).toContain("Validation issue:");
+			expect(sentMessages[0]?.message).toContain(
+				"First, read src/file.ts to refresh current file state before deciding what to change.",
+			);
+
+			const blocked = await toolCall(
+				{
+					toolName: "write",
+					input: { path: "@src/file.ts", reason: "fallback", content: "next" },
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					ui: { notify() {} },
+				} as any,
+			);
+
+			expect(blocked).toEqual({
+				block: true,
+				reason: "Blocked write: must read src/file.ts first, then decide whether to use edit or write.",
+			});
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("allows approve when native edit preview is valid", async () => {
+		const { toolCall, sentMessages } = createReviewHarness();
+		const directory = await mkdtemp(join(tmpdir(), "diffloop-approve-valid-"));
+
+		try {
+			await mkdir(join(directory, "src"), { recursive: true });
+			await writeFile(join(directory, "src/file.ts"), "if (old) {\n\treturn old;\n}\n");
+
+			const result = await toolCall(
+				{
+					toolName: "edit",
+					input: {
+						path: "@src/file.ts",
+						reason: "Update condition",
+						edits: [{ oldText: "if (old)", newText: "if (new)" }],
+					},
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					isIdle: () => true,
+					ui: {
+						custom: async () => "approve",
+						notify() {},
+					},
+				} as any,
+			);
+
+			expect(result).toBeUndefined();
+			expect(sentMessages).toEqual([]);
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
 	test("sends edited write proposals back to the agent for read-first replanning", async () => {
 		const { toolCall, sentHiddenMessages } = createReviewHarness();
 		const customResults = ["edit"];
