@@ -13,12 +13,16 @@ import reviewChanges, {
 function createReviewHarness() {
 	const handlers = new Map<string, Function>();
 	const sentMessages: Array<{ message: string; options?: unknown }> = [];
+	const sentHiddenMessages: Array<{ message: unknown; options?: unknown }> = [];
 
 	reviewChanges({
 		registerCommand() {},
 		registerTool() {},
 		sendUserMessage(message: string, options?: unknown) {
 			sentMessages.push({ message, options });
+		},
+		sendMessage(message: unknown, options?: unknown) {
+			sentHiddenMessages.push({ message, options });
 		},
 		on(event: string, handler: Function) {
 			handlers.set(event, handler);
@@ -27,7 +31,7 @@ function createReviewHarness() {
 
 	const toolCall = handlers.get("tool_call");
 	if (!toolCall) throw new Error("tool_call handler was not registered");
-	return { toolCall, sentMessages };
+	return { toolCall, sentMessages, sentHiddenMessages };
 }
 
 function registerToolCallHandler() {
@@ -143,7 +147,7 @@ describe("normalizeReviewModeAction", () => {
 });
 
 describe("buildSteeringInstruction", () => {
-	test("formats developer feedback as a steering instruction for the agent", () => {
+	test("formats developer feedback as a read-first replanning instruction", () => {
 		expect(
 			buildSteeringInstruction(
 				"edit",
@@ -154,19 +158,19 @@ describe("buildSteeringInstruction", () => {
 		).toBe(
 			[
 				"Do not execute the previously proposed edit for src/file.ts.",
-				"Revise the edit proposal for src/file.ts based on this developer feedback: preserve comments and change only the targeted branch",
+				"Developer feedback to apply: preserve comments and change only the targeted branch",
 				"Previous rationale: Fix the bug",
-				"Keep the review flow going by replying with an updated edit tool call for src/file.ts.",
-				"Do not end with a normal text response or a completed review summary.",
-				"Respond by proposing an updated tool call with a concise reason before making changes again.",
+				"First, read src/file.ts to refresh current file state before deciding what to change.",
+				"After reading, choose the appropriate next step (edit or write) and continue only if a change is still needed.",
+				"Do not reply with plain JSON arguments.",
 			].join("\n"),
 		);
 	});
 
 	test("returns undefined for empty steering input", () => {
 		expect(
-		buildSteeringInstruction("write", "file.ts", { path: "file.ts", reason: "Create file", content: "x" }, "   "),
-	).toBeUndefined();
+			buildSteeringInstruction("write", "file.ts", { path: "file.ts", reason: "Create file", content: "x" }, "   "),
+		).toBeUndefined();
 	});
 });
 
@@ -315,20 +319,74 @@ describe("reviewChanges", () => {
 			{
 				message: [
 					"Do not execute the previously proposed edit for src/file.ts.",
-					"Revise the edit proposal for src/file.ts based on this developer feedback: preserve comments and keep the fallback path unchanged",
+					"Developer feedback to apply: preserve comments and keep the fallback path unchanged",
 					"Previous rationale: Tighten the branch condition",
-					"Keep the review flow going by replying with an updated edit tool call for src/file.ts.",
-					"Do not end with a normal text response or a completed review summary.",
-					"Respond by proposing an updated tool call with a concise reason before making changes again.",
+					"First, read src/file.ts to refresh current file state before deciding what to change.",
+					"After reading, choose the appropriate next step (edit or write) and continue only if a change is still needed.",
+					"Do not reply with plain JSON arguments.",
 				].join("\n"),
 				options: { deliverAs: "steer" },
 			},
 		]);
 	});
 
-	test("opens ctx.ui.editor for a write proposal even when the target file does not exist yet", async () => {
-		const toolCall = registerToolCallHandler();
-		const customResults = ["edit", "approve"];
+	test("requires a read call after steering before allowing a new edit/write", async () => {
+		const { toolCall } = createReviewHarness();
+
+		await toolCall(
+			{
+				toolName: "edit",
+				input: {
+					path: "@src/file.ts",
+					reason: "Initial proposal",
+					edits: [{ oldText: "old", newText: "new" }],
+				},
+			},
+			{
+				hasUI: true,
+				cwd: process.cwd(),
+				isIdle: () => true,
+				ui: {
+					custom: async () => ({ action: "steer", steering: "refine" }),
+					notify() {},
+				},
+			} as any,
+		);
+
+		const blocked = await toolCall(
+			{
+				toolName: "write",
+				input: { path: "@src/file.ts", reason: "Try write", content: "next" },
+			},
+			{
+				hasUI: true,
+				cwd: process.cwd(),
+				ui: { notify() {} },
+			} as any,
+		);
+
+		expect(blocked).toEqual({
+			block: true,
+			reason: "Blocked write: must read src/file.ts first, then decide whether to use edit or write.",
+		});
+
+		const readResult = await toolCall(
+			{
+				toolName: "read",
+				input: { path: "@src/file.ts" },
+			},
+			{
+				hasUI: true,
+				cwd: process.cwd(),
+				ui: { notify() {} },
+			} as any,
+		);
+		expect(readResult).toBeUndefined();
+	});
+
+	test("sends edited write proposals back to the agent for read-first replanning", async () => {
+		const { toolCall, sentHiddenMessages } = createReviewHarness();
+		const customResults = ["edit"];
 		const event = {
 			toolName: "write",
 			input: {
@@ -344,25 +402,24 @@ describe("reviewChanges", () => {
 			isIdle: () => true,
 			ui: {
 				custom: async () => customResults.shift(),
-				input: async () => {
-					throw new Error("edit action should not prompt to change the reason");
-				},
 				editor: async () => "second draft",
 				notify() {},
 			},
 		} as any);
 
-		expect(result).toBeUndefined();
-		expect(event.input).toEqual({
-			path: "notes.txt",
-			reason: "Create notes",
-			content: "second draft",
+		expect(result).toEqual({
+			block: true,
+			reason: "Developer edited write for notes.txt and requested replanning",
 		});
+		expect(sentHiddenMessages[0]?.options).toEqual({ deliverAs: "steer" });
+		expect((sentHiddenMessages[0]?.message as any)?.display).toBe(false);
+		expect((sentHiddenMessages[0]?.message as any)?.content).toContain("The developer edited the proposal for notes.txt");
+		expect((sentHiddenMessages[0]?.message as any)?.content).toContain("First, read notes.txt to refresh current file state.");
 	});
 
-	test("opens ctx.ui.editor on the proposed block when the developer chooses edit for an edit proposal", async () => {
-		const toolCall = registerToolCallHandler();
-		const customResults = ["edit", "approve"];
+	test("sends edited edit proposals back to the agent for read-first replanning", async () => {
+		const { toolCall, sentHiddenMessages } = createReviewHarness();
+		const customResults = ["edit"];
 		const directory = await mkdtemp(join(tmpdir(), "diffloop-edit-proposal-"));
 
 		try {
@@ -384,25 +441,18 @@ describe("reviewChanges", () => {
 				isIdle: () => true,
 				ui: {
 					custom: async () => customResults.shift(),
-					input: async () => {
-						throw new Error("edit action should not prompt to change the reason");
-					},
 					editor: async () => "if (newer)",
 					notify() {},
 				},
 			} as any);
 
-			expect(result).toBeUndefined();
-			expect(event.input).toEqual({
-				path: "src/file.ts",
-				reason: "Update the condition",
-				edits: [
-					{
-						oldText: "if (old)",
-						newText: "if (newer)",
-					},
-				],
+			expect(result).toEqual({
+				block: true,
+				reason: "Developer edited edit for src/file.ts and requested replanning",
 			});
+			expect((sentHiddenMessages[0]?.message as any)?.display).toBe(false);
+			expect((sentHiddenMessages[0]?.message as any)?.content).toContain("The developer edited the proposal for src/file.ts");
+			expect((sentHiddenMessages[0]?.message as any)?.content).toContain("\"newText\": \"if (newer)\"");
 		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}

@@ -12,7 +12,7 @@ import { constants } from "node:fs";
 import { access, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { buildUnifiedDiffPreview, type DiffPreviewLine } from "./diff-preview";
-import { normalizePath, replaceObject, pushLine, pushWrappedLine } from "./utils";
+import { normalizePath, pushLine, pushWrappedLine } from "./utils";
 
 export type ReviewAction = "approve" | "steer" | "edit" | "deny";
 type ReviewDecision = Exclude<ReviewAction, "steer"> | { action: "steer"; steering: string };
@@ -103,6 +103,7 @@ export function normalizeWriteArguments(args: any) {
 
 export default function reviewChanges(pi: ExtensionAPI) {
   let enabled = true;
+  let pendingReadPath: string | undefined;
 
   pi.registerCommand("diffloop", {
     description: "Set diffloop on, off, toggle it, or show the current status",
@@ -196,7 +197,20 @@ export default function reviewChanges(pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
-    if (!enabled || (event.toolName !== "edit" && event.toolName !== "write")) return undefined;
+    if (!enabled || (event.toolName !== "edit" && event.toolName !== "write" && event.toolName !== "read")) {
+      return undefined;
+    }
+
+    if (event.toolName === "read") {
+      const readPath = typeof event.input.path === "string" ? normalizePath(event.input.path) : "";
+      if (pendingReadPath && readPath === pendingReadPath) {
+        pendingReadPath = undefined;
+        if (ctx.hasUI) {
+          ctx.ui.notify(`Read confirmed for ${readPath}. Agent may now choose edit/write.`, "info");
+        }
+      }
+      return undefined;
+    }
 
     if (!ctx.hasUI) {
       return { block: true, reason: `Blocked ${event.toolName}: no interactive UI available for approval` };
@@ -208,6 +222,13 @@ export default function reviewChanges(pi: ExtensionAPI) {
       }
 
       const input = event.input as WriteInput | EditInput;
+      if (pendingReadPath) {
+        return {
+          block: true,
+          reason: `Blocked ${event.toolName}: must read ${pendingReadPath} first, then decide whether to use edit or write.`,
+        };
+      }
+
       if (typeof input.reason !== "string" || !input.reason.trim()) {
         return {
           block: true,
@@ -236,6 +257,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
           continue;
         }
 
+        pendingReadPath = review.path;
         pi.sendUserMessage(message, { deliverAs: "steer" });
         ctx.ui.notify(`Steering sent for ${event.toolName} ${review.path}`, "warning");
         return { block: true, reason: `Developer steered ${event.toolName} for ${review.path}` };
@@ -246,7 +268,17 @@ export default function reviewChanges(pi: ExtensionAPI) {
         ctx.ui.notify("Edit cancelled.", "info");
         continue;
       }
-      replaceObject(event.input as Record<string, unknown>, updated as Record<string, unknown>);
+
+      pendingReadPath = review.path;
+      pi.sendMessage(
+        {
+          customType: "diffloop-hidden-guidance",
+          content: buildEditedProposalInstruction(event.toolName, review.path, updated),
+          display: false,
+        },
+        { deliverAs: "steer" },
+      );
+      return { block: true, reason: `Developer edited ${event.toolName} for ${review.path} and requested replanning` };
     }
   });
 }
@@ -615,14 +647,33 @@ export function buildSteeringInstruction(
   const currentReason = typeof input.reason === "string" && input.reason.trim() ? input.reason.trim() : undefined;
   return [
     `Do not execute the previously proposed ${toolName} for ${normalizedPath}.`,
-    `Revise the ${toolName} proposal for ${normalizedPath} based on this developer feedback: ${feedback}`,
+    `Developer feedback to apply: ${feedback}`,
     currentReason ? `Previous rationale: ${currentReason}` : undefined,
-    `Keep the review flow going by replying with an updated ${toolName} tool call for ${normalizedPath}.`,
-    "Do not end with a normal text response or a completed review summary.",
-    "Respond by proposing an updated tool call with a concise reason before making changes again.",
+    `First, read ${normalizedPath} to refresh current file state before deciding what to change.`,
+    `After reading, choose the appropriate next step (edit or write) and continue only if a change is still needed.`,
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
+}
+
+function buildEditedProposalInstruction(toolName: "write" | "edit", path: string, input: WriteInput | EditInput): string {
+  const normalizedPath = normalizePath(path);
+  const normalizedInput =
+    toolName === "write"
+      ? {
+          path: normalizePath((input as WriteInput).path),
+          reason: (input as WriteInput).reason.trim(),
+          content: (input as WriteInput).content,
+        }
+      : normalizeEditInput(input as EditInput);
+
+  return [
+    `Do not execute the previously proposed ${toolName} for ${normalizedPath}.`,
+    `The developer edited the proposal for ${normalizedPath}; use the updated intent below as guidance.`,
+    JSON.stringify(normalizedInput, null, 2),
+    `First, read ${normalizedPath} to refresh current file state.`,
+    "After reading, decide whether edit or write is the right tool and continue only if a change is still required.",
+  ].join("\n");
 }
 
 export function buildReviewBodyLines(
@@ -906,7 +957,7 @@ function buildNativePreviewWarnings(status: NativeEditBlockStatus): DiffPreviewL
     return [
       {
         kind: "warning",
-        text: `! Edit block ${status.index + 1} oldText was not found by Pi's native edit tool and will fail at execution time.`,
+        text: `! Edit block ${status.index + 1} oldText was not found by Pi'.`,
       },
     ];
   }
@@ -921,7 +972,7 @@ function buildNativePreviewWarnings(status: NativeEditBlockStatus): DiffPreviewL
   return [
     {
       kind: "warning",
-      text: `! Edit block ${status.index + 1} could not be validated by Pi's native edit tool: ${status.error}`,
+      text: `! Edit block ${status.index + 1} could not be validated by Pi: ${status.error}`,
     },
   ];
 }
