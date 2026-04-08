@@ -1,6 +1,6 @@
 {
   "name": "@lpirito/pi-diffloop",
-  "version": "0.0.9",
+  "version": "0.0.10",
   "main": "dist/index.js",
   "description": "Human-in-the-loop review for Pi edit/write tool calls",
   "scripts": {
