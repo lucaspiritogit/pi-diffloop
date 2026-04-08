@@ -162,7 +162,6 @@ describe("buildSteeringInstruction", () => {
 				"Previous rationale: Fix the bug",
 				"First, read src/file.ts to refresh current file state before deciding what to change.",
 				"After reading, choose the appropriate next step (edit or write) and continue only if a change is still needed.",
-				"Do not reply with plain JSON arguments.",
 			].join("\n"),
 		);
 	});
@@ -323,7 +322,6 @@ describe("reviewChanges", () => {
 					"Previous rationale: Tighten the branch condition",
 					"First, read src/file.ts to refresh current file state before deciding what to change.",
 					"After reading, choose the appropriate next step (edit or write) and continue only if a change is still needed.",
-					"Do not reply with plain JSON arguments.",
 				].join("\n"),
 				options: { deliverAs: "steer" },
 			},
