@@ -8,9 +8,11 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { Input, Key, matchesKey } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
+import { spawnSync } from "node:child_process";
 import { constants } from "node:fs";
-import { access, readFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { extname, join, resolve } from "node:path";
 import { normalizePath, pushLine, pushWrappedLine } from "./utils";
 
 type DiffPreviewLineKind = "meta" | "context" | "add" | "remove" | "warning";
@@ -36,6 +38,7 @@ type ReviewData = {
 };
 
 const DIFFLOOP_REVIEW_STATUS = "diffloop";
+const EDITED_PROPOSAL_DIR = join(homedir(), ".pi/agent/extensions/diffloop/file-edits");
 const baseEditToolDefinition = createEditToolDefinition(process.cwd());
 const baseWriteToolDefinition = createWriteToolDefinition(process.cwd());
 
@@ -129,8 +132,26 @@ function resolveExecutionRoot(ctx: ExtensionContext | undefined): string {
 
 export default function reviewChanges(pi: ExtensionAPI) {
   let enabled = true;
-  let pendingReadPath: string | undefined;
+  const pendingReadPaths = new Set<string>();
+  let pendingEditedProposalPath: string | undefined;
+  let pendingEditedProposalReadToolCallId: string | undefined;
   let denyHold = false;
+
+  const clearPendingEditedProposal = async () => {
+    if (!pendingEditedProposalPath) return;
+    pendingEditedProposalPath = undefined;
+    pendingEditedProposalReadToolCallId = undefined;
+    try {
+      await rm(EDITED_PROPOSAL_DIR, { recursive: true, force: true });
+    } catch {
+      // Ignore cleanup errors.
+    }
+  };
+
+  const clearReadRequirements = async () => {
+    pendingReadPaths.clear();
+    await clearPendingEditedProposal();
+  };
 
   pi.registerCommand("diffloop", {
     description: "Set diffloop on, off, toggle it, or show the current status",
@@ -160,7 +181,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
     if (event.source === "extension") return;
 
     denyHold = false;
-    pendingReadPath = undefined;
+    await clearReadRequirements();
     if (ctx.hasUI) {
       ctx.ui.notify("Deny lock cleared. Reviewing can continue on the new prompt.", "info");
     }
@@ -243,10 +264,26 @@ export default function reviewChanges(pi: ExtensionAPI) {
 
     if (event.toolName === "read") {
       const readPath = typeof event.input.path === "string" ? normalizePath(event.input.path) : "";
-      if (pendingReadPath && readPath === pendingReadPath) {
-        pendingReadPath = undefined;
+      const hadPendingRequirements = pendingReadPaths.size > 0;
+      let clearedAnyRequirement = false;
+      if (readPath) {
+        const absoluteReadPath = resolve(ctx.cwd, readPath);
+        for (const requiredPath of Array.from(pendingReadPaths)) {
+          if (resolve(ctx.cwd, requiredPath) !== absoluteReadPath) {
+            continue;
+          }
+
+          pendingReadPaths.delete(requiredPath);
+          clearedAnyRequirement = true;
+          if (pendingEditedProposalPath && requiredPath === pendingEditedProposalPath) {
+            pendingEditedProposalReadToolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
+          }
+        }
+      }
+
+      if (hadPendingRequirements && clearedAnyRequirement && pendingReadPaths.size === 0) {
         if (ctx.hasUI) {
-          ctx.ui.notify(`Read confirmed for ${readPath}. Agent may now choose edit/write.`, "info");
+          ctx.ui.notify("Read requirements satisfied. Agent may now choose edit/write.", "info");
         }
       }
       return undefined;
@@ -269,10 +306,11 @@ export default function reviewChanges(pi: ExtensionAPI) {
       }
 
       const input = event.input as WriteInput | EditInput;
-      if (pendingReadPath) {
+      if (pendingReadPaths.size > 0) {
+        const requiredReadList = Array.from(pendingReadPaths);
         return {
           block: true,
-          reason: `Blocked ${event.toolName}: must read ${pendingReadPath} first, then decide whether to use edit or write.`,
+          reason: `Blocked ${event.toolName}: must read ${joinPathList(requiredReadList)} first, then decide whether to use edit or write.`,
         };
       }
 
@@ -290,7 +328,9 @@ export default function reviewChanges(pi: ExtensionAPI) {
 
       if (action === "approve") {
         if (review.editPreviewValidation && !review.editPreviewValidation.canApprove) {
-          pendingReadPath = review.path;
+          await clearPendingEditedProposal();
+          pendingReadPaths.clear();
+          pendingReadPaths.add(review.path);
           ctx.ui.notify(`Approval blocked for edit ${review.path}; automatic replanning guidance applied.`, "warning");
           return {
             block: true,
@@ -298,15 +338,13 @@ export default function reviewChanges(pi: ExtensionAPI) {
           };
         }
 
-        ctx.ui.notify(`Approved ${event.toolName} ${review.path}`, "info");
         return undefined;
       }
 
       if (action === "deny") {
         denyHold = true;
-        pendingReadPath = undefined;
+        await clearReadRequirements();
         ctx.abort();
-        ctx.ui.notify(`Denied ${event.toolName} for ${review.path}. Agent stopped; send a new prompt to continue.`, "warning");
         return {
           block: true,
           reason:
@@ -315,26 +353,41 @@ export default function reviewChanges(pi: ExtensionAPI) {
       }
 
       if (typeof action === "object" && action.action === "steer") {
-        const message = buildSteeringInstruction(event.toolName, review.path, input, action.steering);
+        const message = buildSteeringInstruction(event.toolName, review.path, action.steering);
         if (!message) {
           ctx.ui.notify("Enter steering instructions to send feedback to the agent.", "warning");
           continue;
         }
 
-        pendingReadPath = review.path;
-        ctx.ui.notify(`Steering captured for ${event.toolName} ${review.path}`, "warning");
         return { block: true, reason: message };
       }
 
       const updated = await editProposal(ctx, event.toolName, event.input as WriteInput | EditInput);
       if (!updated) {
-        ctx.ui.notify("Edit cancelled.", "info");
         continue;
       }
 
-      ctx.ui.notify(`Edited proposal captured for ${event.toolName} ${review.path}`, "warning");
-      return { block: true, reason: buildEditedProposalInstruction(event.toolName, review.path, updated) };
+      await clearPendingEditedProposal();
+      const editedProposalPath = await persistEditedProposal(ctx.cwd, event.toolName, review.path, updated);
+      pendingEditedProposalPath = editedProposalPath;
+      pendingReadPaths.clear();
+      pendingReadPaths.add(review.path);
+      pendingReadPaths.add(editedProposalPath);
+      return {
+        block: true,
+        reason: buildEditedProposalInstruction(event.toolName, review.path, editedProposalPath),
+      };
     }
+  });
+
+  pi.on("tool_result", async (event) => {
+    if (event.toolName !== "read") return undefined;
+    if (!pendingEditedProposalReadToolCallId) return undefined;
+    if (event.toolCallId !== pendingEditedProposalReadToolCallId) return undefined;
+    if (event.isError) return undefined;
+
+    await clearPendingEditedProposal();
+    return undefined;
   });
 }
 
@@ -701,23 +754,137 @@ async function handleReviewAction(ctx: ExtensionContext, review: ReviewData): Pr
 export function buildSteeringInstruction(
   toolName: "write" | "edit",
   path: string,
-  input: WriteInput | EditInput,
   steering: string,
 ): string | undefined {
   const feedback = steering.trim();
   if (!feedback) return undefined;
 
   const normalizedPath = normalizePath(path);
-  const currentReason = typeof input.reason === "string" && input.reason.trim() ? input.reason.trim() : undefined;
   return [
-    `Do not execute the previously proposed ${toolName} for ${normalizedPath}.`,
-    `Developer feedback to apply: ${feedback}`,
-    currentReason ? `Previous rationale: ${currentReason}` : undefined,
-    `First, read ${normalizedPath} to refresh current file state before deciding what to change.`,
-    `After reading, choose the appropriate next step (edit or write) and continue only if a change is still needed.`,
+    `Revise the proposed ${toolName} for ${normalizedPath}.`,
+    `Developer feedback: ${feedback}`,
+    `Submit one updated proposal (edit or write) only if a change is still needed.`,
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
+}
+
+function buildEditedProposalInstruction(toolName: "write" | "edit", path: string, editedProposalPath: string): string {
+  const normalizedPath = normalizePath(path);
+  return [
+    `Developer edited the proposed ${toolName} for ${normalizedPath}. Do not execute the previous proposal.`,
+    `Read ${normalizedPath} and ${editedProposalPath}.`,
+    `Treat ${editedProposalPath} as the authoritative developer-edited candidate source file.`,
+    "Reassess for syntax/behavior issues. If you find any, explain briefly before proposing.",
+    "Then submit one updated proposal (edit or write) for review.",
+  ].join("\n");
+}
+
+function joinPathList(paths: string[]): string {
+  if (paths.length === 0) return "required files";
+  if (paths.length === 1) return paths[0]!;
+  if (paths.length === 2) return `${paths[0]} and ${paths[1]}`;
+  return `${paths.slice(0, -1).join(", ")}, and ${paths[paths.length - 1]}`;
+}
+
+type NativeEditCandidateResult = { ok: true; content: string } | { ok: false; error: string };
+
+async function runNativeEditCandidate(cwd: string, path: string, edits: EditBlock[]): Promise<NativeEditCandidateResult> {
+  let candidateContent: string | undefined;
+
+  const nativeEdit = createEditToolDefinition(cwd, {
+    operations: {
+      async access(absolutePath: string) {
+        await access(absolutePath, constants.R_OK | constants.W_OK);
+      },
+      async readFile(absolutePath: string) {
+        return readFile(absolutePath);
+      },
+      async writeFile(_absolutePath: string, content: string) {
+        candidateContent = content;
+      },
+    },
+  });
+
+  try {
+    await nativeEdit.execute(
+      "diffloop-edited-proposal-candidate",
+      { path, edits },
+      undefined,
+      undefined,
+      undefined as any,
+    );
+    return {
+      ok: true,
+      content: candidateContent ?? "",
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function applyEditsBestEffort(baseContent: string, edits: EditBlock[]): string {
+  let content = baseContent;
+  for (const edit of edits) {
+    content = content.replace(edit.oldText, edit.newText);
+  }
+  return content;
+}
+
+async function buildEditedProposalCandidate(
+  cwd: string,
+  toolName: "write" | "edit",
+  path: string,
+  input: WriteInput | EditInput,
+): Promise<string> {
+  if (toolName === "write") {
+    const writeInput = input as WriteInput;
+    return writeInput.content;
+  }
+
+  const normalizedPath = normalizePath(path);
+  const editInput = normalizeEditInput(input as EditInput);
+  const previewCandidate = await runNativeEditCandidate(cwd, normalizedPath, editInput.edits);
+  if (previewCandidate.ok) {
+    return previewCandidate.content;
+  }
+
+  const absolutePath = resolve(cwd, normalizedPath);
+  let baseContent = "";
+  try {
+    baseContent = await readFile(absolutePath, "utf8");
+  } catch (error: any) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+
+  return applyEditsBestEffort(baseContent, editInput.edits);
+}
+
+async function persistEditedProposal(
+  cwd: string,
+  toolName: "write" | "edit",
+  path: string,
+  input: WriteInput | EditInput,
+): Promise<string> {
+  const absoluteDir = EDITED_PROPOSAL_DIR;
+  await mkdir(absoluteDir, { recursive: true });
+
+  const normalizedPath = normalizePath(path);
+  const extension = extname(normalizedPath) || ".txt";
+  const baseName = normalizedPath.split(/[\\/]/).pop() || "file";
+  const baseWithoutExt = baseName.endsWith(extension) ? baseName.slice(0, -extension.length) : baseName;
+  const safeBase = baseWithoutExt.replace(/[^A-Za-z0-9._-]/g, "_") || "file";
+  const timestamp = Date.now();
+  const random = Math.random().toString(36).slice(2, 8);
+  const fileName = `candidate-${safeBase}-${timestamp}-${random}${extension}`;
+  const absolutePath = join(absoluteDir, fileName);
+  const candidateSource = await buildEditedProposalCandidate(cwd, toolName, normalizedPath, input);
+
+  await writeFile(absolutePath, candidateSource, "utf8");
+  return absolutePath;
 }
 
 function buildBlockedEditApprovalInstruction(path: string, input: EditInput, review: ReviewData): string {
@@ -736,58 +903,6 @@ function buildBlockedEditApprovalInstruction(path: string, input: EditInput, rev
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
-}
-
-function buildEditedProposalInstruction(toolName: "write" | "edit", path: string, input: WriteInput | EditInput): string {
-  const normalizedPath = normalizePath(path);
-  const currentReason = typeof input.reason === "string" && input.reason.trim() ? input.reason.trim() : undefined;
-  const editedPayload = buildEditedProposalPayload(toolName, input);
-
-  return [
-    `Do not execute the previously proposed ${toolName} for ${normalizedPath}.`,
-    `The developer edited the proposal for ${normalizedPath} in review mode; treat that edit as authoritative feedback and use it as your new starting point.`,
-    "Developer-edited proposal to apply:",
-    editedPayload,
-    currentReason ? `Previous rationale: ${currentReason}` : undefined,
-    "Then evaluate the developer-edited proposal for missing behavior, regressions, and possible bugs.",
-    "Do not force a read only to refresh state after this review edit; continue directly from the developer-edited proposal unless you detect likely file drift.",
-    "After that analysis, decide whether edit or write is the right tool and submit a new proposal that preserves the developer edit unless an adjustment is required.",
-  ]
-    .filter((line): line is string => Boolean(line))
-    .join("\n");
-}
-
-function buildEditedProposalPayload(toolName: "write" | "edit", input: WriteInput | EditInput): string {
-  if (toolName === "write") {
-    const writeInput = input as WriteInput;
-    return JSON.stringify(
-      {
-        toolName,
-        path: normalizePath(writeInput.path),
-        reason: writeInput.reason.trim(),
-        content: writeInput.content,
-      },
-      null,
-      2,
-    );
-  }
-
-  const editInput = normalizeEditInput(input as EditInput);
-  const edits = editInput.edits.map((edit) => ({
-    oldText: edit.oldText,
-    newText: edit.newText,
-  }));
-
-  return JSON.stringify(
-    {
-      toolName,
-      path: editInput.path,
-      reason: editInput.reason,
-      edits,
-    },
-    null,
-    2,
-  );
 }
 
 export function buildReviewBodyLines(
@@ -837,9 +952,11 @@ async function editProposal(
   if (toolName === "write") {
     const writeInput = input as WriteInput;
 
-    const content = await ctx.ui.editor(
-      `Edit proposed content for ${normalizePath(writeInput.path)}`,
+    const content = await openProposalInEditor(
+      ctx,
+      normalizePath(writeInput.path),
       writeInput.content,
+      `Edit proposed content for ${normalizePath(writeInput.path)}`,
     );
     if (content === undefined) return undefined;
 
@@ -854,7 +971,7 @@ async function editProposal(
 
   if (current.edits.length === 1) {
     const edit = current.edits[0]!;
-    const content = await ctx.ui.editor(`Edit proposed block for ${current.path}`, edit.newText);
+    const content = await openProposalInEditor(ctx, current.path, edit.newText, `Edit proposed block for ${current.path}`);
     if (content === undefined) return undefined;
 
     return normalizeEditInput({
@@ -881,9 +998,11 @@ async function editProposal(
   if (selectedIndex < 0) return undefined;
 
   const selectedEdit = current.edits[selectedIndex]!;
-  const content = await ctx.ui.editor(
-    `Edit proposed block ${selectedIndex + 1} for ${current.path}`,
+  const content = await openProposalInEditor(
+    ctx,
+    current.path,
     selectedEdit.newText,
+    `Edit proposed block ${selectedIndex + 1} for ${current.path}`,
   );
   if (content === undefined) return undefined;
 
@@ -894,6 +1013,87 @@ async function editProposal(
       index === selectedIndex ? { oldText: edit.oldText, newText: content } : edit,
     ),
   });
+}
+
+type ExternalEditorResult = {
+  exitCode: number;
+  errorMessage?: string;
+};
+
+async function openProposalInEditor(
+  ctx: ExtensionContext,
+  path: string,
+  initialContent: string,
+  fallbackTitle: string,
+): Promise<string | undefined> {
+  const editorCmd = process.env.EDITOR || process.env.VISUAL;
+  if (!editorCmd) {
+    return ctx.ui.editor(fallbackTitle, initialContent);
+  }
+
+  const fileExtension = extname(path) || ".txt";
+  const tempDir = await mkdtemp(join(tmpdir(), "diffloop-editor-"));
+  const draftPath = join(tempDir, `proposal${fileExtension}`);
+
+  try {
+    await writeFile(draftPath, initialContent, "utf8");
+
+    const shell = process.env.SHELL || "/bin/sh";
+    const escapedPath = draftPath.replace(/(["\\`$])/g, "\\$1");
+    const command = `${editorCmd} "${escapedPath}"`;
+
+    const result = await ctx.ui.custom<ExternalEditorResult>(
+      (tui, _theme, _kb, done) => {
+        tui.stop();
+        process.stdout.write("\x1b[2J\x1b[H");
+
+        try {
+          const run = spawnSync(shell, ["-c", command], {
+            stdio: "inherit",
+            env: process.env,
+          });
+
+          done({
+            exitCode: run.status ?? 1,
+            errorMessage: run.error instanceof Error ? run.error.message : undefined,
+          });
+        } catch (error) {
+          done({
+            exitCode: 1,
+            errorMessage: error instanceof Error ? error.message : String(error),
+          });
+        } finally {
+          tui.start();
+          tui.requestRender(true);
+        }
+
+        return { render: () => [], invalidate: () => {} };
+      },
+      {
+        overlay: true,
+        overlayOptions: {
+          anchor: "bottom-center",
+          width: "100%",
+          maxHeight: "100%",
+          margin: 0,
+        },
+      },
+    );
+
+    if (result.exitCode !== 0) {
+      ctx.ui.notify(
+        result.errorMessage
+          ? `External editor failed: ${result.errorMessage}`
+          : `External editor exited with code ${result.exitCode}.`,
+        "warning",
+      );
+      return undefined;
+    }
+
+    return (await readFile(draftPath, "utf8")).replace(/\n$/, "");
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 }
 
 async function runNativeEditPreview(cwd: string, path: string, edits: EditBlock[]): Promise<NativeEditPreviewResult> {
