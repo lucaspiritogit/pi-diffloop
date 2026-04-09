@@ -11,8 +11,14 @@ import { Type } from "@sinclair/typebox";
 import { constants } from "node:fs";
 import { access, readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { buildUnifiedDiffPreview, type DiffPreviewLine } from "./diff-preview";
 import { normalizePath, pushLine, pushWrappedLine } from "./utils";
+
+type DiffPreviewLineKind = "meta" | "context" | "add" | "remove" | "warning";
+
+type DiffPreviewLine = {
+  kind: DiffPreviewLineKind;
+  text: string;
+};
 
 export type ReviewAction = "approve" | "steer" | "edit" | "deny";
 type ReviewDecision = Exclude<ReviewAction, "steer"> | { action: "steer"; steering: string };
@@ -380,16 +386,9 @@ async function buildReviewData(
         canApprove: false,
         errors: validationErrors,
       },
-      changes: editInput.edits.map((edit, index) => ({
+      changes: editInput.edits.map((_edit, index) => ({
         title: `Edit block ${index + 1}`,
-        lines: [
-          { kind: "warning", text: "! Unable to compute file diff because the target file was not found." },
-          ...buildUnifiedDiffPreview(edit.oldText, edit.newText, {
-            beforeLabel: `block ${index + 1} before`,
-            afterLabel: `block ${index + 1} after`,
-            contextLines: 1,
-          }).lines,
-        ],
+        lines: [{ kind: "warning", text: "! Unable to compute file diff because the target file was not found." }],
       })),
     };
   }
