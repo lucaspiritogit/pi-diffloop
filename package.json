@@ -2,7 +2,7 @@
   "name": "@lpirito/pi-diffloop",
   "version": "0.0.13",
   "main": "dist/index.js",
-  "description": "Human-in-the-loop review for Pi edit/write tool calls",
+  "description": "Pair programming with Pi, be aware of every change made to the codebase.",
   "scripts": {
     "build": "rm -rf dist && bunx tsc -p tsconfig.json",
     "prepack": "bun run build",
