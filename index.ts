@@ -317,7 +317,6 @@ export default function reviewChanges(pi: ExtensionAPI) {
         continue;
       }
 
-      pendingReadPath = review.path;
       ctx.ui.notify(`Edited proposal captured for ${event.toolName} ${review.path}`, "warning");
       return { block: true, reason: buildEditedProposalInstruction(event.toolName, review.path, updated) };
     }
@@ -734,16 +733,60 @@ function buildBlockedEditApprovalInstruction(path: string, input: EditInput, rev
 function buildEditedProposalInstruction(toolName: "write" | "edit", path: string, input: WriteInput | EditInput): string {
   const normalizedPath = normalizePath(path);
   const currentReason = typeof input.reason === "string" && input.reason.trim() ? input.reason.trim() : undefined;
+  const editedPayload = buildEditedProposalPayload(toolName, input);
 
   return [
     `Do not execute the previously proposed ${toolName} for ${normalizedPath}.`,
-    `The developer edited the proposal for ${normalizedPath} in review mode; regenerate a fresh proposal without reusing the prior payload verbatim.`,
+    `The developer edited the proposal for ${normalizedPath} in review mode; treat that edit as authoritative feedback and use it as your new starting point.`,
+    "Developer-edited proposal to apply:",
+    editedPayload,
     currentReason ? `Previous rationale: ${currentReason}` : undefined,
-    `First, read ${normalizedPath} to refresh current file state.`,
-    "After reading, decide whether edit or write is the right tool and continue only if a change is still required.",
+    "Then evaluate the developer-edited proposal for missing behavior, regressions, and possible bugs.",
+    "Do not force a read only to refresh state after this review edit; continue directly from the developer-edited proposal unless you detect likely file drift.",
+    "After that analysis, decide whether edit or write is the right tool and submit a new proposal that preserves the developer edit unless an adjustment is required.",
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
+}
+
+function buildEditedProposalPayload(toolName: "write" | "edit", input: WriteInput | EditInput): string {
+  if (toolName === "write") {
+    const writeInput = input as WriteInput;
+    return JSON.stringify(
+      {
+        toolName,
+        path: normalizePath(writeInput.path),
+        reason: writeInput.reason.trim(),
+        content: truncateInstructionText(writeInput.content, 4000),
+      },
+      null,
+      2,
+    );
+  }
+
+  const editInput = normalizeEditInput(input as EditInput);
+  const maxBlocks = 8;
+  const edits = editInput.edits.slice(0, maxBlocks).map((edit) => ({
+    oldText: truncateInstructionText(edit.oldText, 1200),
+    newText: truncateInstructionText(edit.newText, 1200),
+  }));
+
+  return JSON.stringify(
+    {
+      toolName,
+      path: editInput.path,
+      reason: editInput.reason,
+      edits,
+      ...(editInput.edits.length > maxBlocks ? { omittedEditBlocks: editInput.edits.length - maxBlocks } : {}),
+    },
+    null,
+    2,
+  );
+}
+
+function truncateInstructionText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)}\n... [truncated ${text.length - maxChars} chars]`;
 }
 
 export function buildReviewBodyLines(
