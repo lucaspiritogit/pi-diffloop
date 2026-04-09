@@ -36,8 +36,8 @@ type ReviewData = {
 };
 
 const DIFFLOOP_REVIEW_STATUS = "diffloop";
-const nativeEditTool = createEditToolDefinition(process.cwd());
-const nativeWriteTool = createWriteToolDefinition(process.cwd());
+const baseEditToolDefinition = createEditToolDefinition(process.cwd());
+const baseWriteToolDefinition = createWriteToolDefinition(process.cwd());
 
 type EditBlock = EditToolInput["edits"][number];
 type EditInput = EditToolInput & { reason: string };
@@ -54,7 +54,7 @@ type NativeEditBlockStatus = {
 
 const EditParams = Type.Object(
   {
-    ...nativeEditTool.parameters.properties,
+    ...baseEditToolDefinition.parameters.properties,
     reason: Type.String({
       description: "In-depth explanation of why this exact file change is being proposed for human review",
     }),
@@ -64,7 +64,7 @@ const EditParams = Type.Object(
 
 const WriteParams = Type.Object(
   {
-    ...nativeWriteTool.parameters.properties,
+    ...baseWriteToolDefinition.parameters.properties,
     reason: Type.String({
       description: "In-depth explanation of why this file should be created or overwritten for human review",
     }),
@@ -120,6 +120,13 @@ export function normalizeWriteArguments(args: any) {
   };
 }
 
+function resolveExecutionRoot(ctx: ExtensionContext | undefined): string {
+  if (ctx && typeof ctx.cwd === "string" && ctx.cwd.length > 0) {
+    return ctx.cwd;
+  }
+  return process.cwd();
+}
+
 export default function reviewChanges(pi: ExtensionAPI) {
   let enabled = true;
   let pendingReadPath: string | undefined;
@@ -160,7 +167,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    ...nativeEditTool,
+    ...baseEditToolDefinition,
     description: [
       "Edit a single file using exact text replacement. Always include `reason`.",
       "Do not explain changes in generic prose.",
@@ -173,7 +180,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
     promptSnippet:
       "Use edit for precise file changes. Include a specific `reason` tied to the existing code pattern, the exact behavior being changed, and the expected impact.",
     promptGuidelines: [
-      ...(nativeEditTool.promptGuidelines ?? []),
+      ...(baseEditToolDefinition.promptGuidelines ?? []),
       "For every edit call, include a specific `reason` that explains what changes, why it is needed, and what behavior it affects.",
       "Do not use generic explanations; anchor the reason in the surrounding code, constraints, or preserved behavior.",
       "Keep edit blocks focused so the human reviewer can inspect and approve each change easily.",
@@ -181,6 +188,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
     parameters: EditParams,
     prepareArguments: normalizeEditArguments,
     async execute(toolCallId, params, signal, onUpdate, toolCtx) {
+      const nativeEditTool = createEditToolDefinition(resolveExecutionRoot(toolCtx));
       return nativeEditTool.execute(
         toolCallId,
         {
@@ -195,7 +203,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    ...nativeWriteTool,
+    ...baseWriteToolDefinition,
     description: [
       "Create or overwrite a file. Always include `reason`.",
       "Do not explain changes in generic prose.",
@@ -206,7 +214,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
       "- keep the rationale concrete, scoped, and file-specific",
     ].join("\n"),
     promptGuidelines: [
-      ...(nativeWriteTool.promptGuidelines ?? []),
+      ...(baseWriteToolDefinition.promptGuidelines ?? []),
       "For every write call, include a specific `reason` that explains what the file is for, why it is needed, and what behavior it enables or changes.",
       "Do not use generic explanations; reference neighboring files, conventions, or usage expectations when relevant.",
       "Prefer concise, reviewable writes that the human can inspect and edit before execution.",
@@ -214,6 +222,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
     parameters: WriteParams,
     prepareArguments: normalizeWriteArguments,
     async execute(toolCallId, params, signal, onUpdate, toolCtx) {
+      const nativeWriteTool = createWriteToolDefinition(resolveExecutionRoot(toolCtx));
       return nativeWriteTool.execute(
         toolCallId,
         {
@@ -756,7 +765,7 @@ function buildEditedProposalPayload(toolName: "write" | "edit", input: WriteInpu
         toolName,
         path: normalizePath(writeInput.path),
         reason: writeInput.reason.trim(),
-        content: truncateInstructionText(writeInput.content, 4000),
+        content: writeInput.content,
       },
       null,
       2,
@@ -764,10 +773,9 @@ function buildEditedProposalPayload(toolName: "write" | "edit", input: WriteInpu
   }
 
   const editInput = normalizeEditInput(input as EditInput);
-  const maxBlocks = 8;
-  const edits = editInput.edits.slice(0, maxBlocks).map((edit) => ({
-    oldText: truncateInstructionText(edit.oldText, 1200),
-    newText: truncateInstructionText(edit.newText, 1200),
+  const edits = editInput.edits.map((edit) => ({
+    oldText: edit.oldText,
+    newText: edit.newText,
   }));
 
   return JSON.stringify(
@@ -776,16 +784,10 @@ function buildEditedProposalPayload(toolName: "write" | "edit", input: WriteInpu
       path: editInput.path,
       reason: editInput.reason,
       edits,
-      ...(editInput.edits.length > maxBlocks ? { omittedEditBlocks: editInput.edits.length - maxBlocks } : {}),
     },
     null,
     2,
   );
-}
-
-function truncateInstructionText(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text;
-  return `${text.slice(0, maxChars)}\n... [truncated ${text.length - maxChars} chars]`;
 }
 
 export function buildReviewBodyLines(
@@ -1008,19 +1010,13 @@ function buildPreviewFromNativeEditDiff(diff: string) {
   };
 }
 
-function buildWriteContentPreview(content: string, maxLines = 200): DiffPreviewLine[] {
+function buildWriteContentPreview(content: string): DiffPreviewLine[] {
   if (content.length === 0) {
     return [{ kind: "meta", text: "(empty file)" }];
   }
 
   const lines = content.split("\n");
-  const previewLines: DiffPreviewLine[] = lines.slice(0, maxLines).map((line) => ({ kind: "add", text: `+${line}` }));
-
-  if (lines.length > maxLines) {
-    previewLines.push({ kind: "meta", text: `... (${lines.length - maxLines} more line(s) truncated)` });
-  }
-
-  return previewLines;
+  return lines.map((line) => ({ kind: "add", text: `+${line}` }));
 }
 
 async function getNativeEditBlockStatuses(
@@ -1116,9 +1112,9 @@ function describeEditBlockOption(edit: EditBlock, index: number, status?: Native
   return `Block ${index + 1}${suffix}: ${preview}`;
 }
 
-function summarizeCodeSnippet(text: string, maxLength = 60): string {
+function summarizeCodeSnippet(text: string): string {
   const singleLine = text.replace(/\s+/g, " ").trim() || "(empty)";
-  return singleLine.length <= maxLength ? singleLine : `${singleLine.slice(0, maxLength - 1)}…`;
+  return singleLine;
 }
 
 export function normalizeEditInput(input: EditInput): EditInput {
