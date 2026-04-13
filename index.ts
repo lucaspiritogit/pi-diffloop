@@ -36,6 +36,7 @@ import {
   joinPathList,
 } from "./tool-hooks";
 import { normalizePath, pathExists } from "./utils";
+import { getCachedDiffloopUpdateVersion } from "./version-status";
 
 export { clearCandidateFilesDirectory } from "./candidate-files";
 export { buildReviewBodyLines } from "./review-ui";
@@ -132,6 +133,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
   let pendingEditedProposalReadToolCallId: string | undefined;
   let denyHold = false;
   const candidateFiles = createCandidateFilesSessionManager();
+  let availableUpdateVersion: string | undefined;
 
   const clearPendingEditedProposal = async () => {
     pendingEditedProposalPath = undefined;
@@ -144,6 +146,14 @@ export default function reviewChanges(pi: ExtensionAPI) {
     await clearPendingEditedProposal();
   };
 
+  const setPendingReadRequirements = (...paths: Array<string | undefined>) => {
+    pendingReadPaths.clear();
+    for (const path of paths) {
+      if (!path) continue;
+      pendingReadPaths.add(path);
+    }
+  };
+
   pi.registerCommand("diffloop", {
     description: "Set diffloop on, off, toggle it, or show the current status",
     handler: async (args, ctx) => {
@@ -151,7 +161,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
 
       if (action === "invalid") {
         ctx.ui.notify("Usage: /diffloop [on|off|toggle|status]", "error");
-        displayDiffloopStatus(ctx, enabled);
+        displayDiffloopStatus(ctx, enabled, false, availableUpdateVersion);
         return;
       }
 
@@ -159,7 +169,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
       if (action === "on") enabled = true;
       if (action === "off") enabled = false;
 
-      displayDiffloopStatus(ctx, enabled, true);
+      displayDiffloopStatus(ctx, enabled, true, availableUpdateVersion);
     },
   });
 
@@ -167,7 +177,14 @@ export default function reviewChanges(pi: ExtensionAPI) {
     await candidateFiles.clearSessionDirectory();
     candidateFiles.setSessionFromContext(ctx);
     await clearStaleCandidateDirectories();
-    displayDiffloopStatus(ctx, enabled);
+    displayDiffloopStatus(ctx, enabled, false, availableUpdateVersion);
+
+    void (async () => {
+      availableUpdateVersion = await getCachedDiffloopUpdateVersion();
+      if (availableUpdateVersion) {
+        displayDiffloopStatus(ctx, enabled, false, availableUpdateVersion);
+      }
+    })();
   });
 
   pi.on("input", async (event, ctx) => {
@@ -236,28 +253,26 @@ export default function reviewChanges(pi: ExtensionAPI) {
     }
 
     if (event.toolName === "read") {
-      const readPath = typeof event.input.path === "string" ? normalizePath(event.input.path) : "";
-      const hadPendingRequirements = pendingReadPaths.size > 0;
-      let clearedAnyRequirement = false;
-      if (readPath) {
-        const absoluteReadPath = resolve(ctx.cwd, readPath);
-        for (const requiredPath of Array.from(pendingReadPaths)) {
-          if (resolve(ctx.cwd, requiredPath) !== absoluteReadPath) {
-            continue;
-          }
+      if (pendingReadPaths.size === 0) return undefined;
 
-          pendingReadPaths.delete(requiredPath);
-          clearedAnyRequirement = true;
-          if (pendingEditedProposalPath && requiredPath === pendingEditedProposalPath) {
-            pendingEditedProposalReadToolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
-          }
+      const normalizedReadPath = typeof event.input.path === "string" ? normalizePath(event.input.path) : "";
+      if (!normalizedReadPath) return undefined;
+
+      const absoluteReadPath = resolve(ctx.cwd, normalizedReadPath);
+      const matchedRequiredPaths = Array.from(pendingReadPaths).filter(
+        (requiredPath) => resolve(ctx.cwd, requiredPath) === absoluteReadPath,
+      );
+      if (matchedRequiredPaths.length === 0) return undefined;
+
+      for (const requiredPath of matchedRequiredPaths) {
+        pendingReadPaths.delete(requiredPath);
+        if (pendingEditedProposalPath && requiredPath === pendingEditedProposalPath) {
+          pendingEditedProposalReadToolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
         }
       }
 
-      if (hadPendingRequirements && clearedAnyRequirement && pendingReadPaths.size === 0) {
-        if (ctx.hasUI) {
-          ctx.ui.notify("Read requirements satisfied. Agent may now choose edit/write.", "info");
-        }
+      if (pendingReadPaths.size === 0 && ctx.hasUI) {
+        ctx.ui.notify("Read requirements satisfied. Agent may now choose edit/write.", "info");
       }
       return undefined;
     }
@@ -278,28 +293,27 @@ export default function reviewChanges(pi: ExtensionAPI) {
         event.input.path = normalizePath(event.input.path);
       }
 
-      const input = event.input as WriteInput | EditInput;
-      const normalizedInputPath = normalizePath(input.path || "");
+      const proposedInput = event.input as WriteInput | EditInput;
+      const normalizedInputPath = normalizePath(proposedInput.path || "");
       if (!isPathInReviewScope(normalizedInputPath, reviewScope)) {
         return undefined;
       }
 
       if (pendingReadPaths.size > 0) {
-        const requiredReadList = Array.from(pendingReadPaths);
         return {
           block: true,
-          reason: `Blocked ${event.toolName}: read ${joinPathList(requiredReadList)} first.`,
+          reason: `Blocked ${event.toolName}: read ${joinPathList(Array.from(pendingReadPaths))} first.`,
         };
       }
 
-      if (typeof input.reason !== "string" || !input.reason.trim()) {
+      if (typeof proposedInput.reason !== "string" || !proposedInput.reason.trim()) {
         return {
           block: true,
           reason: `Blocked ${event.toolName}: include a non-empty reason and retry.`,
         };
       }
 
-      input.reason = input.reason.trim();
+      proposedInput.reason = proposedInput.reason.trim();
 
       let writeCandidatePath: string | undefined;
       if (event.toolName === "write") {
@@ -307,55 +321,50 @@ export default function reviewChanges(pi: ExtensionAPI) {
         writeCandidatePath = await persistEditedProposal(
           ctx.cwd,
           "write",
-          input.path,
-          input as WriteInput,
+          proposedInput.path,
+          proposedInput as WriteInput,
           await candidateFiles.ensureDirectory(ctx),
         );
       }
 
-      const review = await buildReviewData(
-        ctx,
-        event.toolName,
-        event.input as WriteInput | EditInput,
-        writeCandidatePath,
-      );
+      const review = await buildReviewData(ctx, event.toolName, proposedInput, writeCandidatePath);
 
       const action = await handleReviewAction(ctx, review);
 
       if (action === "approve") {
-        if (review.editPreviewValidation && !review.editPreviewValidation.canApprove) {
-          await clearPendingEditedProposal();
-          pendingReadPaths.clear();
+        const editPreviewValidation = review.editPreviewValidation;
+        if (!editPreviewValidation || editPreviewValidation.canApprove) {
+          return undefined;
+        }
 
-          if (review.editPreviewValidation.missingTarget) {
-            const missingTargetCandidatePath = await persistEditedProposal(
-              ctx.cwd,
-              "edit",
-              review.path,
-              input as EditInput,
-              await candidateFiles.ensureDirectory(ctx),
-            );
-            pendingEditedProposalPath = missingTargetCandidatePath;
-            pendingReadPaths.add(missingTargetCandidatePath);
-            ctx.ui.notify(
-              `Approval blocked for edit ${review.path}; target file is missing, switching to candidate-file replanning.`,
-              "warning",
-            );
-            return {
-              block: true,
-              reason: buildMissingTargetEditInstruction(review.path, input as EditInput, missingTargetCandidatePath),
-            };
-          }
+        await clearPendingEditedProposal();
 
-          pendingReadPaths.add(review.path);
-          ctx.ui.notify(`Approval blocked for edit ${review.path}; automatic replanning guidance applied.`, "warning");
+        if (editPreviewValidation.missingTarget) {
+          const missingTargetCandidatePath = await persistEditedProposal(
+            ctx.cwd,
+            "edit",
+            review.path,
+            proposedInput as EditInput,
+            await candidateFiles.ensureDirectory(ctx),
+          );
+          pendingEditedProposalPath = missingTargetCandidatePath;
+          setPendingReadRequirements(missingTargetCandidatePath);
+          ctx.ui.notify(
+            `Approval blocked for edit ${review.path}; target file is missing, switching to candidate-file replanning.`,
+            "warning",
+          );
           return {
             block: true,
-            reason: buildBlockedEditApprovalInstruction(review.path, input as EditInput, review),
+            reason: buildMissingTargetEditInstruction(review.path, proposedInput as EditInput, missingTargetCandidatePath),
           };
         }
 
-        return undefined;
+        setPendingReadRequirements(review.path);
+        ctx.ui.notify(`Approval blocked for edit ${review.path}; automatic replanning guidance applied.`, "warning");
+        return {
+          block: true,
+          reason: buildBlockedEditApprovalInstruction(review.path, proposedInput as EditInput, review),
+        };
       }
 
       if (action === "deny") {
@@ -378,7 +387,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
         return { block: true, reason: message };
       }
 
-      const updated = await editProposal(ctx, event.toolName, event.input as WriteInput | EditInput);
+      const updated = await editProposal(ctx, event.toolName, proposedInput);
       if (!updated) {
         continue;
       }
@@ -393,11 +402,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
       );
       const requireTargetRead = await pathExists(resolve(ctx.cwd, review.path));
       pendingEditedProposalPath = editedProposalPath;
-      pendingReadPaths.clear();
-      if (requireTargetRead) {
-        pendingReadPaths.add(review.path);
-      }
-      pendingReadPaths.add(editedProposalPath);
+      setPendingReadRequirements(requireTargetRead ? review.path : undefined, editedProposalPath);
       return {
         block: true,
         reason: buildEditedProposalInstruction(event.toolName, review.path, editedProposalPath, requireTargetRead),
@@ -406,37 +411,39 @@ export default function reviewChanges(pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", async (event, ctx) => {
-    if ((event.toolName === "edit" || event.toolName === "write") && event.isError) {
+    const isEditOrWriteError = (event.toolName === "edit" || event.toolName === "write") && event.isError;
+    if (isEditOrWriteError) {
       const failedPath = typeof event.input?.path === "string" ? normalizePath(event.input.path) : "";
-      if (failedPath) {
-        await clearPendingEditedProposal();
-        pendingReadPaths.clear();
-        pendingReadPaths.add(failedPath);
+      if (!failedPath) return undefined;
 
-        if (ctx.hasUI) {
-          ctx.ui.notify(
-            `Detected ${event.toolName} execution error on ${failedPath}; enforcing read-first retry before the next edit/write.`,
-            "warning",
-          );
-        }
+      await clearPendingEditedProposal();
+      setPendingReadRequirements(failedPath);
 
-        return {
-          content: [
-            ...event.content,
-            {
-              type: "text" as const,
-              text: `Diffloop recovery: read ${failedPath} and then submit one revised ${event.toolName} proposal.`,
-            },
-          ],
-        };
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          `Detected ${event.toolName} execution error on ${failedPath}; enforcing read-first retry before the next edit/write.`,
+          "warning",
+        );
       }
-      return undefined;
+
+      return {
+        content: [
+          ...event.content,
+          {
+            type: "text" as const,
+            text: `Diffloop recovery: read ${failedPath} and then submit one revised ${event.toolName} proposal.`,
+          },
+        ],
+      };
     }
 
-    if (event.toolName !== "read") return undefined;
-    if (!pendingEditedProposalReadToolCallId) return undefined;
-    if (event.toolCallId !== pendingEditedProposalReadToolCallId) return undefined;
-    if (event.isError) return undefined;
+    const isSuccessfulReadOfEditedProposal =
+      event.toolName === "read" &&
+      Boolean(pendingEditedProposalReadToolCallId) &&
+      event.toolCallId === pendingEditedProposalReadToolCallId &&
+      !event.isError;
+
+    if (!isSuccessfulReadOfEditedProposal) return undefined;
 
     await clearPendingEditedProposal();
     return undefined;
@@ -778,11 +785,20 @@ export function normalizeReviewModeAction(args?: string): "on" | "off" | "toggle
   return "invalid";
 }
 
-function displayDiffloopStatus(ctx: ExtensionContext, enabled: boolean, announce = false) {
+function displayDiffloopStatus(
+  ctx: ExtensionContext,
+  enabled: boolean,
+  announce = false,
+  availableUpdateVersion?: string,
+) {
   if (!ctx.hasUI) return;
 
-  const statusText = enabled ? ctx.ui.theme.fg("warning", "diffloop on") : ctx.ui.theme.fg("dim", "diffloop off");
-  ctx.ui.setStatus(DIFFLOOP_REVIEW_STATUS, statusText);
+  const baseStatusText = enabled ? ctx.ui.theme.fg("warning", "diffloop on") : ctx.ui.theme.fg("dim", "diffloop off");
+  const updateStatusText = availableUpdateVersion
+    ? ctx.ui.theme.fg("accent", ` update v${availableUpdateVersion} available`)
+    : "";
+
+  ctx.ui.setStatus(DIFFLOOP_REVIEW_STATUS, `${baseStatusText}${updateStatusText}`);
   if (announce) {
     ctx.ui.notify(`Diffloop ${enabled ? "on" : "off"}`, enabled ? "warning" : "info");
   }
