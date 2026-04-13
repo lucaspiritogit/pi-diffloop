@@ -319,6 +319,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
         event.input as WriteInput | EditInput,
         writeCandidatePath,
       );
+
       const action = await handleReviewAction(ctx, review);
 
       if (action === "approve") {
@@ -404,7 +405,34 @@ export default function reviewChanges(pi: ExtensionAPI) {
     }
   });
 
-  pi.on("tool_result", async (event) => {
+  pi.on("tool_result", async (event, ctx) => {
+    if ((event.toolName === "edit" || event.toolName === "write") && event.isError) {
+      const failedPath = typeof event.input?.path === "string" ? normalizePath(event.input.path) : "";
+      if (failedPath) {
+        await clearPendingEditedProposal();
+        pendingReadPaths.clear();
+        pendingReadPaths.add(failedPath);
+
+        if (ctx.hasUI) {
+          ctx.ui.notify(
+            `Detected ${event.toolName} execution error on ${failedPath}; enforcing read-first retry before the next edit/write.`,
+            "warning",
+          );
+        }
+
+        return {
+          content: [
+            ...event.content,
+            {
+              type: "text" as const,
+              text: `Diffloop recovery: read ${failedPath} and then submit one revised ${event.toolName} proposal.`,
+            },
+          ],
+        };
+      }
+      return undefined;
+    }
+
     if (event.toolName !== "read") return undefined;
     if (!pendingEditedProposalReadToolCallId) return undefined;
     if (event.toolCallId !== pendingEditedProposalReadToolCallId) return undefined;

@@ -566,13 +566,98 @@ describe("reviewChanges", () => {
 		expect(afterInput).toBeUndefined();
 	});
 
+	test("enforces read-first retry after edit/write execution errors", async () => {
+		const { toolCall, toolResult } = createReviewHarness();
+		const directory = await mkdtemp(join(tmpdir(), "diffloop-tool-error-retry-"));
+
+		try {
+			await mkdir(join(directory, "src"), { recursive: true });
+			await writeFile(join(directory, "src/file.ts"), "const value = 1;\n");
+
+			const recovered = await toolResult(
+				{
+					toolName: "edit",
+					toolCallId: "edit-error-1",
+					input: {
+						path: "@src/file.ts",
+						reason: "Update declaration",
+						edits: [{ oldText: "const missing = 2;", newText: "const value = 2;" }],
+					},
+					content: [{ type: "text", text: "native edit failed" }],
+					details: undefined,
+					isError: true,
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					ui: { notify() {} },
+				} as any,
+			);
+
+			const recoveredContent = ((recovered as any)?.content ?? []) as Array<{ text?: string }>;
+			expect(recoveredContent[recoveredContent.length - 1]?.text).toContain("read src/file.ts");
+
+			const blocked = await toolCall(
+				{
+					toolName: "write",
+					input: { path: "@src/file.ts", reason: "retry", content: "const value = 2;\n" },
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					ui: {
+						custom: async () => {
+							throw new Error("read-first retry should block before opening review UI");
+						},
+						notify() {},
+					},
+				} as any,
+			);
+			expectBlockedWithReason(blocked);
+			expect((blocked as any).reason).toContain("read src/file.ts first");
+
+			const readAttempt = await toolCall(
+				{
+					toolName: "read",
+					toolCallId: "read-after-error",
+					input: { path: "@src/file.ts" },
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					ui: { notify() {} },
+				} as any,
+			);
+			expect(readAttempt).toBeUndefined();
+
+			const allowedAfterRead = await toolCall(
+				{
+					toolName: "write",
+					input: { path: "@src/file.ts", reason: "retry", content: "const value = 2;\n" },
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					isIdle: () => true,
+					ui: {
+						custom: async () => "approve",
+						notify() {},
+					},
+				} as any,
+			);
+			expect(allowedAfterRead).toBeUndefined();
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
 	test("blocks approve for invalid edit previews and returns read-first replanning guidance", async () => {
 		const { toolCall, sentMessages } = createReviewHarness();
 		const directory = await mkdtemp(join(tmpdir(), "diffloop-auto-steer-"));
 
 		try {
 			await mkdir(join(directory, "src"), { recursive: true });
-			await writeFile(join(directory, "src/file.ts"), "const value = 1;\n");
+			await writeFile(join(directory, "src/file.ts"), "const value = 1;\nconst value = 2;\n");
 
 			const result = await toolCall(
 				{
@@ -580,7 +665,7 @@ describe("reviewChanges", () => {
 					input: {
 						path: "@src/file.ts",
 						reason: "Update the declaration",
-						edits: [{ oldText: "const missing = 2;", newText: "const value = 2;" }],
+						edits: [{ oldText: "const value = ", newText: "const value = 3" }],
 					},
 				},
 				{
