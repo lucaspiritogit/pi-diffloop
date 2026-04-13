@@ -1,6 +1,6 @@
 {
   "name": "@lpirito/pi-diffloop",
-  "version": "0.0.15",
+  "version": "0.0.16",
   "main": "dist/index.js",
   "description": "Pair programming with Pi, be aware of every change made to the codebase.",
   "scripts": {
