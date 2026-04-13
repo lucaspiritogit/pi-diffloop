@@ -1,14 +1,17 @@
 import { describe, expect, test } from "bun:test";
-import { access, mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import reviewChanges, {
 	buildReviewBodyLines,
 	buildSteeringInstruction,
+	clearCandidateFilesDirectory,
 	normalizeEditInput,
 	normalizeReviewModeAction,
 	normalizeEditArguments,
 } from "./index";
+
+const CANDIDATE_FILES_DIR = "/tmp/diffloop/candidate-files";
 
 function createReviewHarness() {
 	const handlers = new Map<string, Function>();
@@ -47,14 +50,24 @@ function expectBlockedWithReason(result: unknown) {
 }
 
 function extractEditedProposalPath(reason: string): string | undefined {
-	const match = reason.match(/Read [^\n]+ and ([^\n]+)\./);
-	return match?.[1];
+	const match = reason.match(/\/tmp\/diffloop\/candidate-files\/[^\s]+/);
+	if (!match) return undefined;
+	return match[0].replace(/[.,]$/, "");
 }
 
 async function fileExists(path: string): Promise<boolean> {
 	try {
 		await access(path);
 		return true;
+	} catch {
+		return false;
+	}
+}
+
+async function directoryHasEntries(path: string): Promise<boolean> {
+	try {
+		const entries = await readdir(path);
+		return entries.length > 0;
 	} catch {
 		return false;
 	}
@@ -243,6 +256,18 @@ describe("buildReviewBodyLines", () => {
 	});
 });
 
+describe("clearCandidateFilesDirectory", () => {
+	test("removes the candidate directory recursively", async () => {
+		const directory = await mkdtemp(join(tmpdir(), "diffloop-candidate-cleanup-"));
+		await mkdir(join(directory, "nested"), { recursive: true });
+		await writeFile(join(directory, "nested/candidate.ts"), "export const value = 1;\n");
+
+		expect(await fileExists(directory)).toBe(true);
+		await clearCandidateFilesDirectory(directory);
+		expect(await fileExists(directory)).toBe(false);
+	});
+});
+
 describe("reviewChanges", () => {
 	test("registers the command, tools, and lifecycle handlers", () => {
 		const commands: Array<{ name: string; config: unknown }> = [];
@@ -292,6 +317,41 @@ describe("reviewChanges", () => {
 		);
 
 		expectBlockedWithReason(result);
+	});
+
+	test("creates a candidate file when reviewing write proposals", async () => {
+		const { toolCall } = createReviewHarness();
+		const directory = await mkdtemp(join(tmpdir(), "diffloop-write-candidate-"));
+
+		try {
+			await clearCandidateFilesDirectory(CANDIDATE_FILES_DIR);
+
+			const result = await toolCall(
+				{
+					toolName: "write",
+					input: {
+						path: "@notes.txt",
+						reason: "Create notes file",
+						content: "first draft",
+					},
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					isIdle: () => true,
+					ui: {
+						custom: async () => "approve",
+						notify() {},
+					},
+				} as any,
+			);
+
+			expect(result).toBeUndefined();
+			expect(await directoryHasEntries(CANDIDATE_FILES_DIR)).toBe(true);
+		} finally {
+			await clearCandidateFilesDirectory(CANDIDATE_FILES_DIR);
+			await rm(directory, { recursive: true, force: true });
+		}
 	});
 
 	test("sends steering feedback from the review UI without opening a separate input dialog", async () => {
@@ -497,6 +557,110 @@ describe("reviewChanges", () => {
 		}
 	});
 
+	test("blocks approve for edits on missing files and routes replanning through candidate files", async () => {
+		const { toolCall, toolResult } = createReviewHarness();
+		const directory = await mkdtemp(join(tmpdir(), "diffloop-missing-target-"));
+
+		try {
+			await mkdir(join(directory, "src"), { recursive: true });
+
+			const first = await toolCall(
+				{
+					toolName: "edit",
+					input: {
+						path: "@src/new-file.ts",
+						reason: "Create the initial implementation",
+						edits: [{ oldText: "placeholder", newText: "export const value = 1;\n" }],
+					},
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					isIdle: () => true,
+					ui: {
+						custom: async () => "approve",
+						notify() {},
+					},
+				} as any,
+			);
+
+			expectBlockedWithReason(first);
+			expect((first as any).reason).toContain("/tmp/diffloop/candidate-files/");
+			const candidatePath = extractEditedProposalPath((first as any).reason as string);
+			expect(candidatePath?.endsWith(".ts")).toBe(true);
+			if (!candidatePath) {
+				throw new Error("Expected a candidate path for missing-target replanning");
+			}
+			expect(await fileExists(candidatePath)).toBe(true);
+
+			const blockedBeforeReads = await toolCall(
+				{
+					toolName: "write",
+					input: { path: "@src/new-file.ts", reason: "Try write", content: "export const value = 2;" },
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					ui: { notify() {} },
+				} as any,
+			);
+
+			expectBlockedWithReason(blockedBeforeReads);
+
+			const readCandidate = await toolCall(
+				{
+					toolName: "read",
+					toolCallId: "read-missing-candidate",
+					input: { path: candidatePath },
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					ui: { notify() {} },
+				} as any,
+			);
+			expect(readCandidate).toBeUndefined();
+
+			const readCandidateResult = await toolResult(
+				{
+					toolName: "read",
+					toolCallId: "read-missing-candidate",
+					input: { path: candidatePath },
+					content: "export const value = 1;",
+					details: {},
+					isError: false,
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					ui: { notify() {} },
+				} as any,
+			);
+			expect(readCandidateResult).toBeUndefined();
+			expect(await fileExists(candidatePath)).toBe(false);
+
+			const allowedAfterReads = await toolCall(
+				{
+					toolName: "write",
+					input: { path: "@src/new-file.ts", reason: "Now write", content: "export const value = 2;" },
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					isIdle: () => true,
+					ui: {
+						custom: async () => "approve",
+						notify() {},
+					},
+				} as any,
+			);
+
+			expect(allowedAfterReads).toBeUndefined();
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
 	test("allows approve when native edit preview is valid", async () => {
 		const { toolCall, sentMessages } = createReviewHarness();
 		const directory = await mkdtemp(join(tmpdir(), "diffloop-approve-valid-"));
@@ -535,159 +699,173 @@ describe("reviewChanges", () => {
 	test("blocks edited write proposals and requests read-first reassessment", async () => {
 		const { toolCall, sentHiddenMessages } = createReviewHarness();
 		const customResults = ["edit"];
-		const event = {
-			toolName: "write",
-			input: {
-				path: "@notes.txt",
-				reason: "Create notes",
-				content: "first draft",
-			},
-		};
+		const directory = await mkdtemp(join(tmpdir(), "diffloop-edited-write-missing-target-"));
 
-		const result = await toolCall(event, {
-			hasUI: true,
-			cwd: process.cwd(),
-			isIdle: () => true,
-			ui: {
-				custom: async () => customResults.shift() ?? "edit",
-				editor: async () => "second draft",
-				notify() {},
-			},
-		} as any);
-
-		expectBlockedWithReason(result);
-		expect((result as any).reason).toContain("Read notes.txt");
-		expect((result as any).reason).toContain(".pi/agent/extensions/diffloop/file-edits/");
-		const candidatePath = extractEditedProposalPath((result as any).reason as string);
-		expect(candidatePath?.endsWith(".json")).toBe(false);
-		expect(candidatePath?.endsWith(".txt")).toBe(true);
-		expect(sentHiddenMessages).toEqual([]);
-	});
-
-	test("requires a read after developer edits a proposal before allowing a new edit/write", async () => {
-		const { toolCall, toolResult } = createReviewHarness();
-		const customResults = ["edit", "approve"];
-
-		const first = await toolCall(
-			{
+		try {
+			const event = {
 				toolName: "write",
 				input: {
 					path: "@notes.txt",
 					reason: "Create notes",
 					content: "first draft",
 				},
-			},
-			{
+			};
+
+			const result = await toolCall(event, {
 				hasUI: true,
-				cwd: process.cwd(),
+				cwd: directory,
 				isIdle: () => true,
 				ui: {
 					custom: async () => customResults.shift() ?? "edit",
 					editor: async () => "second draft",
 					notify() {},
 				},
-			} as any,
-		);
-		expectBlockedWithReason(first);
-		const firstReason = (first as any).reason as string;
-		const editedProposalPath = extractEditedProposalPath(firstReason);
-		expect(editedProposalPath).toBeDefined();
-		if (!editedProposalPath) {
-			throw new Error("Expected an edited proposal path in steering instruction");
+			} as any);
+
+			expectBlockedWithReason(result);
+			expect((result as any).reason).not.toContain("Read notes.txt and");
+			expect((result as any).reason).toContain("/tmp/diffloop/candidate-files/");
+			const candidatePath = extractEditedProposalPath((result as any).reason as string);
+			expect(candidatePath?.endsWith(".json")).toBe(false);
+			expect(candidatePath?.endsWith(".txt")).toBe(true);
+			expect(sentHiddenMessages).toEqual([]);
+		} finally {
+			await rm(directory, { recursive: true, force: true });
 		}
+	});
 
-		const blocked = await toolCall(
-			{
-				toolName: "write",
-				input: { path: "@notes.txt", reason: "Try write", content: "next" },
-			},
-			{
-				hasUI: true,
-				cwd: process.cwd(),
-				ui: { notify() {} },
-			} as any,
-		);
+	test("requires reading both target and candidate after developer edits when target already exists", async () => {
+		const { toolCall, toolResult } = createReviewHarness();
+		const customResults = ["edit", "approve"];
+		const directory = await mkdtemp(join(tmpdir(), "diffloop-edited-write-existing-target-"));
 
-		expectBlockedWithReason(blocked);
+		try {
+			await writeFile(join(directory, "notes.txt"), "existing\n");
 
-		const readResult = await toolCall(
-			{
-				toolName: "read",
-				toolCallId: "read-target",
-				input: { path: "@notes.txt" },
-			},
-			{
-				hasUI: true,
-				cwd: process.cwd(),
-				ui: { notify() {} },
-			} as any,
-		);
-		expect(readResult).toBeUndefined();
-
-		const stillBlockedAfterTargetRead = await toolCall(
-			{
-				toolName: "write",
-				input: { path: "@notes.txt", reason: "Try write", content: "next" },
-			},
-			{
-				hasUI: true,
-				cwd: process.cwd(),
-				ui: { notify() {} },
-			} as any,
-		);
-
-		expectBlockedWithReason(stillBlockedAfterTargetRead);
-
-		const readEditedProposal = await toolCall(
-			{
-				toolName: "read",
-				toolCallId: "read-edited-proposal",
-				input: { path: editedProposalPath },
-			},
-			{
-				hasUI: true,
-				cwd: process.cwd(),
-				ui: { notify() {} },
-			} as any,
-		);
-		expect(readEditedProposal).toBeUndefined();
-		expect(await fileExists(editedProposalPath)).toBe(true);
-
-		const readEditedProposalResult = await toolResult(
-			{
-				toolName: "read",
-				toolCallId: "read-edited-proposal",
-				input: { path: editedProposalPath },
-				content: "{}",
-				details: {},
-				isError: false,
-			},
-			{
-				hasUI: true,
-				cwd: process.cwd(),
-				ui: { notify() {} },
-			} as any,
-		);
-		expect(readEditedProposalResult).toBeUndefined();
-		expect(await fileExists(editedProposalPath)).toBe(false);
-
-		const allowedAfterRead = await toolCall(
-			{
-				toolName: "write",
-				input: { path: "@notes.txt", reason: "Try write", content: "next" },
-			},
-			{
-				hasUI: true,
-				cwd: process.cwd(),
-				isIdle: () => true,
-				ui: {
-					custom: async () => customResults.shift() ?? "approve",
-					notify() {},
+			const first = await toolCall(
+				{
+					toolName: "write",
+					input: {
+						path: "@notes.txt",
+						reason: "Create notes",
+						content: "first draft",
+					},
 				},
-			} as any,
-		);
+				{
+					hasUI: true,
+					cwd: directory,
+					isIdle: () => true,
+					ui: {
+						custom: async () => customResults.shift() ?? "edit",
+						editor: async () => "second draft",
+						notify() {},
+					},
+				} as any,
+			);
+			expectBlockedWithReason(first);
+			const firstReason = (first as any).reason as string;
+			expect(firstReason).toContain("Read notes.txt and");
+			const editedProposalPath = extractEditedProposalPath(firstReason);
+			expect(editedProposalPath).toBeDefined();
+			if (!editedProposalPath) {
+				throw new Error("Expected an edited proposal path in steering instruction");
+			}
 
-		expect(allowedAfterRead).toBeUndefined();
+			const blocked = await toolCall(
+				{
+					toolName: "write",
+					input: { path: "@notes.txt", reason: "Try write", content: "next" },
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					ui: { notify() {} },
+				} as any,
+			);
+
+			expectBlockedWithReason(blocked);
+
+			const readResult = await toolCall(
+				{
+					toolName: "read",
+					toolCallId: "read-target",
+					input: { path: "@notes.txt" },
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					ui: { notify() {} },
+				} as any,
+			);
+			expect(readResult).toBeUndefined();
+
+			const stillBlockedAfterTargetRead = await toolCall(
+				{
+					toolName: "write",
+					input: { path: "@notes.txt", reason: "Try write", content: "next" },
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					ui: { notify() {} },
+				} as any,
+			);
+
+			expectBlockedWithReason(stillBlockedAfterTargetRead);
+
+			const readEditedProposal = await toolCall(
+				{
+					toolName: "read",
+					toolCallId: "read-edited-proposal",
+					input: { path: editedProposalPath },
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					ui: { notify() {} },
+				} as any,
+			);
+			expect(readEditedProposal).toBeUndefined();
+			expect(await fileExists(editedProposalPath)).toBe(true);
+
+			const readEditedProposalResult = await toolResult(
+				{
+					toolName: "read",
+					toolCallId: "read-edited-proposal",
+					input: { path: editedProposalPath },
+					content: "{}",
+					details: {},
+					isError: false,
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					ui: { notify() {} },
+				} as any,
+			);
+			expect(readEditedProposalResult).toBeUndefined();
+			expect(await fileExists(editedProposalPath)).toBe(false);
+
+			const allowedAfterRead = await toolCall(
+				{
+					toolName: "write",
+					input: { path: "@notes.txt", reason: "Try write", content: "next" },
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					isIdle: () => true,
+					ui: {
+						custom: async () => customResults.shift() ?? "approve",
+						notify() {},
+					},
+				} as any,
+			);
+
+			expect(allowedAfterRead).toBeUndefined();
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
 	});
 
 	test("blocks edited edit proposals and requests read-first reassessment", async () => {
@@ -721,7 +899,7 @@ describe("reviewChanges", () => {
 
 			expectBlockedWithReason(result);
 			expect((result as any).reason).toContain("Read src/file.ts");
-			expect((result as any).reason).toContain(".pi/agent/extensions/diffloop/file-edits/");
+			expect((result as any).reason).toContain("/tmp/diffloop/candidate-files/");
 			const candidatePath = extractEditedProposalPath((result as any).reason as string);
 			expect(candidatePath?.endsWith(".json")).toBe(false);
 			expect(candidatePath?.endsWith(".ts")).toBe(true);

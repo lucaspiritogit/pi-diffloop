@@ -18,6 +18,12 @@ For each proposed file change, diffloop:
   - **edit** the proposal before execution
   - **deny** the change
 
+## Installation
+
+```sh
+npm i @lpirito/pi-diffloop
+```
+
 ## Why use it
 
 When working with coding agents, I kept running into two extremes:

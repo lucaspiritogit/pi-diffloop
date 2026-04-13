@@ -9,11 +9,11 @@ import {
 import { Input, Key, matchesKey } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { spawnSync } from "node:child_process";
-import { constants } from "node:fs";
+import { constants, rmSync } from "node:fs";
 import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import { extname, join, resolve } from "node:path";
-import { normalizePath, pushLine, pushWrappedLine } from "./utils";
+import { normalizePath, pathExists, pushLine, pushWrappedLine } from "./utils";
 
 type DiffPreviewLineKind = "meta" | "context" | "add" | "remove" | "warning";
 
@@ -34,13 +34,19 @@ type ReviewData = {
   editPreviewValidation?: {
     canApprove: boolean;
     errors: string[];
+    missingTarget?: boolean;
   };
 };
 
 const DIFFLOOP_REVIEW_STATUS = "diffloop";
-const EDITED_PROPOSAL_DIR = join(homedir(), ".pi/agent/extensions/diffloop/file-edits");
+const EDITED_PROPOSAL_DIR = "/tmp/diffloop/candidate-files";
 const baseEditToolDefinition = createEditToolDefinition(process.cwd());
 const baseWriteToolDefinition = createWriteToolDefinition(process.cwd());
+const PROCESS_CLEANUP_REGISTERED_KEY = "__diffloopCandidateFilesCleanupRegistered";
+
+type GlobalCleanupState = typeof globalThis & {
+  [PROCESS_CLEANUP_REGISTERED_KEY]?: boolean;
+};
 
 type EditBlock = EditToolInput["edits"][number];
 type EditInput = EditToolInput & { reason: string };
@@ -130,7 +136,32 @@ function resolveExecutionRoot(ctx: ExtensionContext | undefined): string {
   return process.cwd();
 }
 
+function clearCandidateFilesDirectorySync(directory = EDITED_PROPOSAL_DIR) {
+  try {
+    rmSync(directory, { recursive: true, force: true });
+  } catch {
+  }
+}
+
+export async function clearCandidateFilesDirectory(directory = EDITED_PROPOSAL_DIR) {
+  try {
+    await rm(directory, { recursive: true, force: true });
+  } catch {
+  }
+}
+
+function registerCandidateFilesProcessCleanup() {
+  const state = globalThis as GlobalCleanupState;
+  if (state[PROCESS_CLEANUP_REGISTERED_KEY]) return;
+
+  state[PROCESS_CLEANUP_REGISTERED_KEY] = true;
+  process.once("exit", () => {
+    clearCandidateFilesDirectorySync();
+  });
+}
+
 export default function reviewChanges(pi: ExtensionAPI) {
+  registerCandidateFilesProcessCleanup();
   let enabled = true;
   const pendingReadPaths = new Set<string>();
   let pendingEditedProposalPath: string | undefined;
@@ -138,14 +169,9 @@ export default function reviewChanges(pi: ExtensionAPI) {
   let denyHold = false;
 
   const clearPendingEditedProposal = async () => {
-    if (!pendingEditedProposalPath) return;
     pendingEditedProposalPath = undefined;
     pendingEditedProposalReadToolCallId = undefined;
-    try {
-      await rm(EDITED_PROPOSAL_DIR, { recursive: true, force: true });
-    } catch {
-      // Ignore cleanup errors.
-    }
+    await clearCandidateFilesDirectory();
   };
 
   const clearReadRequirements = async () => {
@@ -173,6 +199,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    await clearCandidateFilesDirectory();
     displayDiffloopStatus(ctx, enabled);
   });
 
@@ -323,13 +350,44 @@ export default function reviewChanges(pi: ExtensionAPI) {
 
       input.reason = input.reason.trim();
 
-      const review = await buildReviewData(ctx, event.toolName, event.input as WriteInput | EditInput);
+      let writeCandidatePath: string | undefined;
+      if (event.toolName === "write") {
+        await clearCandidateFilesDirectory();
+        writeCandidatePath = await persistEditedProposal(ctx.cwd, "write", input.path, input as WriteInput);
+      }
+
+      const review = await buildReviewData(
+        ctx,
+        event.toolName,
+        event.input as WriteInput | EditInput,
+        writeCandidatePath,
+      );
       const action = await handleReviewAction(ctx, review);
 
       if (action === "approve") {
         if (review.editPreviewValidation && !review.editPreviewValidation.canApprove) {
           await clearPendingEditedProposal();
           pendingReadPaths.clear();
+
+          if (review.editPreviewValidation.missingTarget) {
+            const missingTargetCandidatePath = await persistEditedProposal(
+              ctx.cwd,
+              "edit",
+              review.path,
+              input as EditInput,
+            );
+            pendingEditedProposalPath = missingTargetCandidatePath;
+            pendingReadPaths.add(missingTargetCandidatePath);
+            ctx.ui.notify(
+              `Approval blocked for edit ${review.path}; target file is missing, switching to candidate-file replanning.`,
+              "warning",
+            );
+            return {
+              block: true,
+              reason: buildMissingTargetEditInstruction(review.path, input as EditInput, missingTargetCandidatePath),
+            };
+          }
+
           pendingReadPaths.add(review.path);
           ctx.ui.notify(`Approval blocked for edit ${review.path}; automatic replanning guidance applied.`, "warning");
           return {
@@ -353,7 +411,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
       }
 
       if (typeof action === "object" && action.action === "steer") {
-        const message = buildSteeringInstruction(event.toolName, review.path, action.steering);
+        const message = buildSteeringInstruction(event.toolName, review.path, action.steering, writeCandidatePath);
         if (!message) {
           ctx.ui.notify("Enter steering instructions to send feedback to the agent.", "warning");
           continue;
@@ -369,13 +427,16 @@ export default function reviewChanges(pi: ExtensionAPI) {
 
       await clearPendingEditedProposal();
       const editedProposalPath = await persistEditedProposal(ctx.cwd, event.toolName, review.path, updated);
+      const requireTargetRead = await pathExists(resolve(ctx.cwd, review.path));
       pendingEditedProposalPath = editedProposalPath;
       pendingReadPaths.clear();
-      pendingReadPaths.add(review.path);
+      if (requireTargetRead) {
+        pendingReadPaths.add(review.path);
+      }
       pendingReadPaths.add(editedProposalPath);
       return {
         block: true,
-        reason: buildEditedProposalInstruction(event.toolName, review.path, editedProposalPath),
+        reason: buildEditedProposalInstruction(event.toolName, review.path, editedProposalPath, requireTargetRead),
       };
     }
   });
@@ -395,6 +456,7 @@ async function buildReviewData(
   ctx: ExtensionContext,
   toolName: "write" | "edit",
   input: WriteInput | EditInput,
+  candidatePath?: string,
 ): Promise<ReviewData> {
   const path = normalizePath(input.path);
   const reason = input.reason.trim();
@@ -414,6 +476,7 @@ async function buildReviewData(
     const summary = [
       existingContent === undefined ? "Operation: create new file" : "Operation: overwrite existing file",
       `Size: ${writeInput.content.length} characters across ${contentLines} lines`,
+      ...(candidatePath ? [`Candidate file: ${candidatePath}`] : []),
     ];
 
     const warningLines = nativeWritePreview.ok
@@ -439,19 +502,31 @@ async function buildReviewData(
 
   if (existingContent === undefined) {
     const validationErrors = ["Target file was not found on disk."];
+    const candidatePreview = await buildEditedProposalCandidate(ctx.cwd, "edit", path, editInput);
     return {
       toolName,
       path,
       reason,
-      summary: [...summary, "Preview warning: target file does not exist on disk"],
+      summary: [
+        ...summary,
+        "Preview warning: target file does not exist on disk",
+        "Fallback preview: generated candidate content from proposed edit blocks",
+      ],
       editPreviewValidation: {
         canApprove: false,
         errors: validationErrors,
+        missingTarget: true,
       },
-      changes: editInput.edits.map((_edit, index) => ({
-        title: `Edit block ${index + 1}`,
-        lines: [{ kind: "warning", text: "! Unable to compute file diff because the target file was not found." }],
-      })),
+      changes: [
+        {
+          title: "Candidate content preview (target file missing)",
+          lines: [
+            { kind: "warning", text: "! Unable to compute file diff because the target file was not found." },
+            { kind: "warning", text: "! Approval is blocked for edit on missing files; replan with write using candidate content." },
+            ...buildWriteContentPreview(candidatePreview),
+          ],
+        },
+      ],
     };
   }
 
@@ -755,6 +830,7 @@ export function buildSteeringInstruction(
   toolName: "write" | "edit",
   path: string,
   steering: string,
+  candidatePath?: string,
 ): string | undefined {
   const feedback = steering.trim();
   if (!feedback) return undefined;
@@ -763,17 +839,27 @@ export function buildSteeringInstruction(
   return [
     `Revise the proposed ${toolName} for ${normalizedPath}.`,
     `Developer feedback: ${feedback}`,
+    toolName === "write" && candidatePath
+      ? `Read ${candidatePath} if ${normalizedPath} does not exist yet; use it as the latest candidate baseline.`
+      : undefined,
     `Submit one updated proposal (edit or write) only if a change is still needed.`,
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
 }
 
-function buildEditedProposalInstruction(toolName: "write" | "edit", path: string, editedProposalPath: string): string {
+function buildEditedProposalInstruction(
+  toolName: "write" | "edit",
+  path: string,
+  editedProposalPath: string,
+  requireTargetRead: boolean,
+): string {
   const normalizedPath = normalizePath(path);
   return [
     `Developer edited the proposed ${toolName} for ${normalizedPath}. Do not execute the previous proposal.`,
-    `Read ${normalizedPath} and ${editedProposalPath}.`,
+    requireTargetRead
+      ? `Read ${normalizedPath} and ${editedProposalPath}.`
+      : `Read ${editedProposalPath}. ${normalizedPath} does not exist yet.`,
     `Treat ${editedProposalPath} as the authoritative developer-edited candidate source file.`,
     "Reassess for syntax/behavior issues. If you find any, explain briefly before proposing.",
     "Then submit one updated proposal (edit or write) for review.",
@@ -900,6 +986,22 @@ function buildBlockedEditApprovalInstruction(path: string, input: EditInput, rev
     `First, read ${normalizedPath} to refresh current file state before deciding what to change.`,
     `Then propose a new edit with oldText copied exactly from ${normalizedPath}, including whitespace/newlines, and make each block unique with enough surrounding context.`,
     "If exact replacement remains unreliable, switch to write with the complete updated file content.",
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join("\n");
+}
+
+function buildMissingTargetEditInstruction(path: string, input: EditInput, candidatePath: string): string {
+  const normalizedPath = normalizePath(path);
+  const currentReason = typeof input.reason === "string" && input.reason.trim() ? input.reason.trim() : undefined;
+
+  return [
+    `Do not execute the previously proposed edit for ${normalizedPath}.`,
+    "The target file does not exist yet, so native edit cannot apply this change directly.",
+    currentReason ? `Previous rationale: ${currentReason}` : undefined,
+    `Read ${candidatePath}.`,
+    `Treat ${candidatePath} as the developer review candidate for creating ${normalizedPath}.`,
+    `Then submit one write proposal for ${normalizedPath} based on that candidate content.`,
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
