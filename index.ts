@@ -10,7 +10,7 @@ import { Input, Key, matchesKey } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { spawnSync } from "node:child_process";
 import { constants, rmSync } from "node:fs";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join, resolve } from "node:path";
 import { normalizePath, pathExists, pushLine, pushWrappedLine } from "./utils";
@@ -39,13 +39,18 @@ type ReviewData = {
 };
 
 const DIFFLOOP_REVIEW_STATUS = "diffloop";
-const EDITED_PROPOSAL_DIR = "/tmp/diffloop/candidate-files";
+const DIFFLOOP_TEMP_ROOT_DIR = join(tmpdir(), "diffloop");
+const CANDIDATE_FILES_ROOT_DIR = join(DIFFLOOP_TEMP_ROOT_DIR, "candidate-files");
+const CANDIDATE_FILES_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const EPHEMERAL_SESSION_DIR = "ephemeral";
 const baseEditToolDefinition = createEditToolDefinition(process.cwd());
 const baseWriteToolDefinition = createWriteToolDefinition(process.cwd());
 const PROCESS_CLEANUP_REGISTERED_KEY = "__diffloopCandidateFilesCleanupRegistered";
+const PROCESS_CLEANUP_DIRECTORIES_KEY = "__diffloopCandidateFilesCleanupDirectories";
 
 type GlobalCleanupState = typeof globalThis & {
   [PROCESS_CLEANUP_REGISTERED_KEY]?: boolean;
+  [PROCESS_CLEANUP_DIRECTORIES_KEY]?: Set<string>;
 };
 
 type EditBlock = EditToolInput["edits"][number];
@@ -65,7 +70,7 @@ const EditParams = Type.Object(
   {
     ...baseEditToolDefinition.parameters.properties,
     reason: Type.String({
-      description: "In-depth explanation of why this exact file change is being proposed for human review",
+      description: "Why this edit is needed for review.",
     }),
   },
   { additionalProperties: false },
@@ -75,7 +80,7 @@ const WriteParams = Type.Object(
   {
     ...baseWriteToolDefinition.parameters.properties,
     reason: Type.String({
-      description: "In-depth explanation of why this file should be created or overwritten for human review",
+      description: "Why this write is needed for review.",
     }),
   },
   { additionalProperties: false },
@@ -136,17 +141,78 @@ function resolveExecutionRoot(ctx: ExtensionContext | undefined): string {
   return process.cwd();
 }
 
-function clearCandidateFilesDirectorySync(directory = EDITED_PROPOSAL_DIR) {
+function sanitizeSessionDirectoryName(value: string): string {
+  return value.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80) || EPHEMERAL_SESSION_DIR;
+}
+
+function resolveSessionDirectoryName(ctx: ExtensionContext | undefined): string {
+  const rawSessionFile = ctx?.sessionManager?.getSessionFile?.();
+  if (!rawSessionFile || typeof rawSessionFile !== "string") {
+    return EPHEMERAL_SESSION_DIR;
+  }
+
+  const lastSegment = rawSessionFile.split(/[\\/]/).pop() || rawSessionFile;
+  const fileWithoutExt = lastSegment.replace(/\.[^.]+$/, "");
+  return sanitizeSessionDirectoryName(fileWithoutExt);
+}
+
+function clearCandidateFilesDirectorySync(directory = DIFFLOOP_TEMP_ROOT_DIR) {
   try {
     rmSync(directory, { recursive: true, force: true });
   } catch {
   }
 }
 
-export async function clearCandidateFilesDirectory(directory = EDITED_PROPOSAL_DIR) {
+export async function clearCandidateFilesDirectory(directory = DIFFLOOP_TEMP_ROOT_DIR) {
   try {
     await rm(directory, { recursive: true, force: true });
   } catch {
+  }
+}
+
+function getTrackedCleanupDirectories(state: GlobalCleanupState): Set<string> {
+  if (!state[PROCESS_CLEANUP_DIRECTORIES_KEY]) {
+    state[PROCESS_CLEANUP_DIRECTORIES_KEY] = new Set<string>();
+  }
+  return state[PROCESS_CLEANUP_DIRECTORIES_KEY]!;
+}
+
+function trackCleanupDirectory(directory: string) {
+  const state = globalThis as GlobalCleanupState;
+  getTrackedCleanupDirectories(state).add(directory);
+}
+
+function untrackCleanupDirectory(directory: string) {
+  const state = globalThis as GlobalCleanupState;
+  getTrackedCleanupDirectories(state).delete(directory);
+}
+
+async function clearStaleCandidateDirectories(
+  rootDirectory = CANDIDATE_FILES_ROOT_DIR,
+  maxAgeMs = CANDIDATE_FILES_MAX_AGE_MS,
+) {
+  let entries;
+  try {
+    entries = await readdir(rootDirectory, { withFileTypes: true, encoding: "utf8" });
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return;
+    return;
+  }
+
+  const now = Date.now();
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+
+    const absolutePath = join(rootDirectory, entry.name);
+    let entryStats;
+    try {
+      entryStats = await stat(absolutePath);
+    } catch {
+      continue;
+    }
+
+    if (now - entryStats.mtimeMs < maxAgeMs) continue;
+    await clearCandidateFilesDirectory(absolutePath);
   }
 }
 
@@ -155,23 +221,76 @@ function registerCandidateFilesProcessCleanup() {
   if (state[PROCESS_CLEANUP_REGISTERED_KEY]) return;
 
   state[PROCESS_CLEANUP_REGISTERED_KEY] = true;
-  process.once("exit", () => {
-    clearCandidateFilesDirectorySync();
+
+  const runCleanup = () => {
+    for (const directory of getTrackedCleanupDirectories(state)) {
+      clearCandidateFilesDirectorySync(directory);
+    }
+  };
+
+  process.once("exit", runCleanup);
+  process.once("SIGINT", () => {
+    runCleanup();
+    process.exit(130);
+  });
+  process.once("SIGTERM", () => {
+    runCleanup();
+    process.exit(143);
   });
 }
 
 export default function reviewChanges(pi: ExtensionAPI) {
   registerCandidateFilesProcessCleanup();
+  void clearStaleCandidateDirectories();
+
   let enabled = true;
   const pendingReadPaths = new Set<string>();
   let pendingEditedProposalPath: string | undefined;
   let pendingEditedProposalReadToolCallId: string | undefined;
+  let candidateFilesDirectory: string | undefined;
+  let sessionDirectoryName = EPHEMERAL_SESSION_DIR;
   let denyHold = false;
+
+  const ensureCandidateFilesDirectory = async (ctx?: ExtensionContext): Promise<string> => {
+    if (ctx) {
+      sessionDirectoryName = resolveSessionDirectoryName(ctx);
+    }
+
+    if (candidateFilesDirectory) return candidateFilesDirectory;
+
+    await mkdir(DIFFLOOP_TEMP_ROOT_DIR, { recursive: true, mode: 0o700 });
+    await mkdir(CANDIDATE_FILES_ROOT_DIR, { recursive: true, mode: 0o700 });
+    try {
+      await chmod(DIFFLOOP_TEMP_ROOT_DIR, 0o700);
+      await chmod(CANDIDATE_FILES_ROOT_DIR, 0o700);
+    } catch {
+    }
+
+    const sessionDir = join(CANDIDATE_FILES_ROOT_DIR, sessionDirectoryName);
+    await mkdir(sessionDir, { recursive: true, mode: 0o700 });
+    try {
+      await chmod(sessionDir, 0o700);
+    } catch {
+    }
+
+    candidateFilesDirectory = sessionDir;
+    trackCleanupDirectory(sessionDir);
+    return sessionDir;
+  };
+
+  const clearSessionCandidateFiles = async () => {
+    if (!candidateFilesDirectory) return;
+
+    const currentDirectory = candidateFilesDirectory;
+    candidateFilesDirectory = undefined;
+    untrackCleanupDirectory(currentDirectory);
+    await clearCandidateFilesDirectory(currentDirectory);
+  };
 
   const clearPendingEditedProposal = async () => {
     pendingEditedProposalPath = undefined;
     pendingEditedProposalReadToolCallId = undefined;
-    await clearCandidateFilesDirectory();
+    await clearSessionCandidateFiles();
   };
 
   const clearReadRequirements = async () => {
@@ -199,7 +318,9 @@ export default function reviewChanges(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    await clearCandidateFilesDirectory();
+    await clearSessionCandidateFiles();
+    sessionDirectoryName = resolveSessionDirectoryName(ctx);
+    await clearStaleCandidateDirectories();
     displayDiffloopStatus(ctx, enabled);
   });
 
@@ -216,22 +337,11 @@ export default function reviewChanges(pi: ExtensionAPI) {
 
   pi.registerTool({
     ...baseEditToolDefinition,
-    description: [
-      "Edit a single file using exact text replacement. Always include `reason`.",
-      "Do not explain changes in generic prose.",
-      "You must:",
-      "- reference existing code patterns or nearby logic",
-      "- describe exactly what this edit changes",
-      "- describe behavior impact and preserved behavior when relevant",
-      "- keep the rationale concrete, scoped, and file-specific",
-    ].join("\n"),
-    promptSnippet:
-      "Use edit for precise file changes. Include a specific `reason` tied to the existing code pattern, the exact behavior being changed, and the expected impact.",
+    description: "Edit one file using exact oldText/newText blocks. Include a non-empty `reason`.",
+    promptSnippet: "Use edit for precise replacements and include a concrete `reason`.",
     promptGuidelines: [
       ...(baseEditToolDefinition.promptGuidelines ?? []),
-      "For every edit call, include a specific `reason` that explains what changes, why it is needed, and what behavior it affects.",
-      "Do not use generic explanations; anchor the reason in the surrounding code, constraints, or preserved behavior.",
-      "Keep edit blocks focused so the human reviewer can inspect and approve each change easily.",
+      "Keep `reason` specific to this file change and avoid generic prose.",
     ],
     parameters: EditParams,
     prepareArguments: normalizeEditArguments,
@@ -252,20 +362,10 @@ export default function reviewChanges(pi: ExtensionAPI) {
 
   pi.registerTool({
     ...baseWriteToolDefinition,
-    description: [
-      "Create or overwrite a file. Always include `reason`.",
-      "Do not explain changes in generic prose.",
-      "You must:",
-      "- reference existing repository conventions, neighboring files, or code patterns when relevant",
-      "- describe what the file contains or what is being replaced",
-      "- describe behavior impact and intended usage",
-      "- keep the rationale concrete, scoped, and file-specific",
-    ].join("\n"),
+    description: "Create or overwrite one file. Include a non-empty `reason`.",
     promptGuidelines: [
       ...(baseWriteToolDefinition.promptGuidelines ?? []),
-      "For every write call, include a specific `reason` that explains what the file is for, why it is needed, and what behavior it enables or changes.",
-      "Do not use generic explanations; reference neighboring files, conventions, or usage expectations when relevant.",
-      "Prefer concise, reviewable writes that the human can inspect and edit before execution.",
+      "Keep `reason` concrete and file-specific.",
     ],
     parameters: WriteParams,
     prepareArguments: normalizeWriteArguments,
@@ -324,7 +424,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
       if (denyHold) {
         return {
           block: true,
-          reason: "Developer denied the previous change. Stop execution and wait for a new user prompt before using tools again.",
+          reason: "Developer denied the previous change. Wait for a new user prompt.",
         };
       }
 
@@ -337,14 +437,14 @@ export default function reviewChanges(pi: ExtensionAPI) {
         const requiredReadList = Array.from(pendingReadPaths);
         return {
           block: true,
-          reason: `Blocked ${event.toolName}: must read ${joinPathList(requiredReadList)} first, then decide whether to use edit or write.`,
+          reason: `Blocked ${event.toolName}: read ${joinPathList(requiredReadList)} first.`,
         };
       }
 
       if (typeof input.reason !== "string" || !input.reason.trim()) {
         return {
           block: true,
-          reason: `Blocked ${event.toolName}: missing required reason. Re-propose this ${event.toolName} with a concise explanation of what it changes and why.`,
+          reason: `Blocked ${event.toolName}: include a non-empty reason and retry.`,
         };
       }
 
@@ -352,8 +452,14 @@ export default function reviewChanges(pi: ExtensionAPI) {
 
       let writeCandidatePath: string | undefined;
       if (event.toolName === "write") {
-        await clearCandidateFilesDirectory();
-        writeCandidatePath = await persistEditedProposal(ctx.cwd, "write", input.path, input as WriteInput);
+        await clearSessionCandidateFiles();
+        writeCandidatePath = await persistEditedProposal(
+          ctx.cwd,
+          "write",
+          input.path,
+          input as WriteInput,
+          await ensureCandidateFilesDirectory(ctx),
+        );
       }
 
       const review = await buildReviewData(
@@ -375,6 +481,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
               "edit",
               review.path,
               input as EditInput,
+              await ensureCandidateFilesDirectory(ctx),
             );
             pendingEditedProposalPath = missingTargetCandidatePath;
             pendingReadPaths.add(missingTargetCandidatePath);
@@ -405,8 +512,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
         ctx.abort();
         return {
           block: true,
-          reason:
-            "Developer denied the proposed change. Stop now and do not continue this plan. Wait for a new user prompt before attempting further edits or writes.",
+          reason: "Developer denied the proposal. Stop and wait for a new user prompt.",
         };
       }
 
@@ -426,7 +532,13 @@ export default function reviewChanges(pi: ExtensionAPI) {
       }
 
       await clearPendingEditedProposal();
-      const editedProposalPath = await persistEditedProposal(ctx.cwd, event.toolName, review.path, updated);
+      const editedProposalPath = await persistEditedProposal(
+        ctx.cwd,
+        event.toolName,
+        review.path,
+        updated,
+        await ensureCandidateFilesDirectory(ctx),
+      );
       const requireTargetRead = await pathExists(resolve(ctx.cwd, review.path));
       pendingEditedProposalPath = editedProposalPath;
       pendingReadPaths.clear();
@@ -837,12 +949,10 @@ export function buildSteeringInstruction(
 
   const normalizedPath = normalizePath(path);
   return [
-    `Revise the proposed ${toolName} for ${normalizedPath}.`,
-    `Developer feedback: ${feedback}`,
-    toolName === "write" && candidatePath
-      ? `Read ${candidatePath} if ${normalizedPath} does not exist yet; use it as the latest candidate baseline.`
-      : undefined,
-    `Submit one updated proposal (edit or write) only if a change is still needed.`,
+    `Revise ${toolName} for ${normalizedPath}.`,
+    `Feedback: ${feedback}`,
+    toolName === "write" && candidatePath ? `If ${normalizedPath} is missing, read ${candidatePath}.` : undefined,
+    "Submit one revised edit/write proposal if still needed.",
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
@@ -856,13 +966,12 @@ function buildEditedProposalInstruction(
 ): string {
   const normalizedPath = normalizePath(path);
   return [
-    `Developer edited the proposed ${toolName} for ${normalizedPath}. Do not execute the previous proposal.`,
+    `Replace the previous ${toolName} proposal for ${normalizedPath}.`,
     requireTargetRead
       ? `Read ${normalizedPath} and ${editedProposalPath}.`
       : `Read ${editedProposalPath}. ${normalizedPath} does not exist yet.`,
-    `Treat ${editedProposalPath} as the authoritative developer-edited candidate source file.`,
-    "Reassess for syntax/behavior issues. If you find any, explain briefly before proposing.",
-    "Then submit one updated proposal (edit or write) for review.",
+    `Use ${editedProposalPath} as the candidate source.`,
+    "Submit one updated edit/write proposal.",
   ].join("\n");
 }
 
@@ -954,9 +1063,9 @@ async function persistEditedProposal(
   toolName: "write" | "edit",
   path: string,
   input: WriteInput | EditInput,
+  candidateDirectory: string,
 ): Promise<string> {
-  const absoluteDir = EDITED_PROPOSAL_DIR;
-  await mkdir(absoluteDir, { recursive: true });
+  await mkdir(candidateDirectory, { recursive: true, mode: 0o700 });
 
   const normalizedPath = normalizePath(path);
   const extension = extname(normalizedPath) || ".txt";
@@ -966,10 +1075,10 @@ async function persistEditedProposal(
   const timestamp = Date.now();
   const random = Math.random().toString(36).slice(2, 8);
   const fileName = `candidate-${safeBase}-${timestamp}-${random}${extension}`;
-  const absolutePath = join(absoluteDir, fileName);
+  const absolutePath = join(candidateDirectory, fileName);
   const candidateSource = await buildEditedProposalCandidate(cwd, toolName, normalizedPath, input);
 
-  await writeFile(absolutePath, candidateSource, "utf8");
+  await writeFile(absolutePath, candidateSource, { encoding: "utf8", mode: 0o600 });
   return absolutePath;
 }
 
@@ -979,13 +1088,11 @@ function buildBlockedEditApprovalInstruction(path: string, input: EditInput, rev
   const validationErrors = review.editPreviewValidation?.errors ?? ["Native preview validation failed."];
 
   return [
-    `Do not execute the previously proposed edit for ${normalizedPath}.`,
-    "The proposal could not be approved because Pi's native edit preview reported validation failures.",
-    ...validationErrors.map((error) => `Validation issue: ${error}`),
-    currentReason ? `Previous rationale: ${currentReason}` : undefined,
-    `First, read ${normalizedPath} to refresh current file state before deciding what to change.`,
-    `Then propose a new edit with oldText copied exactly from ${normalizedPath}, including whitespace/newlines, and make each block unique with enough surrounding context.`,
-    "If exact replacement remains unreliable, switch to write with the complete updated file content.",
+    `Do not execute the previous edit for ${normalizedPath}.`,
+    `Native preview failed: ${validationErrors.join("; ")}`,
+    currentReason ? `Previous reason: ${currentReason}` : undefined,
+    `Read ${normalizedPath}, then propose a new exact-match edit with unique oldText blocks.`,
+    "If exact matching still fails, switch to write with full file content.",
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
@@ -996,12 +1103,11 @@ function buildMissingTargetEditInstruction(path: string, input: EditInput, candi
   const currentReason = typeof input.reason === "string" && input.reason.trim() ? input.reason.trim() : undefined;
 
   return [
-    `Do not execute the previously proposed edit for ${normalizedPath}.`,
-    "The target file does not exist yet, so native edit cannot apply this change directly.",
-    currentReason ? `Previous rationale: ${currentReason}` : undefined,
+    `Do not execute the previous edit for ${normalizedPath}.`,
+    "Target file is missing, so edit cannot apply.",
+    currentReason ? `Previous reason: ${currentReason}` : undefined,
     `Read ${candidatePath}.`,
-    `Treat ${candidatePath} as the developer review candidate for creating ${normalizedPath}.`,
-    `Then submit one write proposal for ${normalizedPath} based on that candidate content.`,
+    `Then submit one write proposal for ${normalizedPath} from that candidate content.`,
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
@@ -1138,7 +1244,12 @@ async function openProposalInEditor(
   const draftPath = join(tempDir, `proposal${fileExtension}`);
 
   try {
-    await writeFile(draftPath, initialContent, "utf8");
+    try {
+      await chmod(tempDir, 0o700);
+    } catch {
+    }
+
+    await writeFile(draftPath, initialContent, { encoding: "utf8", mode: 0o600 });
 
     const shell = process.env.SHELL || "/bin/sh";
     const escapedPath = draftPath.replace(/(["\\`$])/g, "\\$1");

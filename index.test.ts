@@ -11,7 +11,7 @@ import reviewChanges, {
 	normalizeEditArguments,
 } from "./index";
 
-const CANDIDATE_FILES_DIR = "/tmp/diffloop/candidate-files";
+const CANDIDATE_FILES_DIR = join(tmpdir(), "diffloop", "candidate-files");
 
 function createReviewHarness() {
 	const handlers = new Map<string, Function>();
@@ -50,7 +50,7 @@ function expectBlockedWithReason(result: unknown) {
 }
 
 function extractEditedProposalPath(reason: string): string | undefined {
-	const match = reason.match(/\/tmp\/diffloop\/candidate-files\/[^\s]+/);
+	const match = reason.match(/\S*candidate-files\/[^/\s]+\/[^\s]+/);
 	if (!match) return undefined;
 	return match[0].replace(/[.,]$/, "");
 }
@@ -585,7 +585,7 @@ describe("reviewChanges", () => {
 			);
 
 			expectBlockedWithReason(first);
-			expect((first as any).reason).toContain("/tmp/diffloop/candidate-files/");
+			expect((first as any).reason).toContain("candidate-files/");
 			const candidatePath = extractEditedProposalPath((first as any).reason as string);
 			expect(candidatePath?.endsWith(".ts")).toBe(true);
 			if (!candidatePath) {
@@ -724,7 +724,7 @@ describe("reviewChanges", () => {
 
 			expectBlockedWithReason(result);
 			expect((result as any).reason).not.toContain("Read notes.txt and");
-			expect((result as any).reason).toContain("/tmp/diffloop/candidate-files/");
+			expect((result as any).reason).toContain("candidate-files/");
 			const candidatePath = extractEditedProposalPath((result as any).reason as string);
 			expect(candidatePath?.endsWith(".json")).toBe(false);
 			expect(candidatePath?.endsWith(".txt")).toBe(true);
@@ -899,7 +899,7 @@ describe("reviewChanges", () => {
 
 			expectBlockedWithReason(result);
 			expect((result as any).reason).toContain("Read src/file.ts");
-			expect((result as any).reason).toContain("/tmp/diffloop/candidate-files/");
+			expect((result as any).reason).toContain("candidate-files/");
 			const candidatePath = extractEditedProposalPath((result as any).reason as string);
 			expect(candidatePath?.endsWith(".json")).toBe(false);
 			expect(candidatePath?.endsWith(".ts")).toBe(true);

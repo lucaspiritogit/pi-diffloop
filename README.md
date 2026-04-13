@@ -58,6 +58,23 @@ When the agent proposes an `edit` or `write`:
 3. it opens a review UI
 4. you choose one of the available actions
 
+## Candidate files (temporary review artifacts)
+
+To support interactive review and replanning, diffloop writes temporary **candidate files** to disk.
+
+- Location: OS temp directory, under `diffloop/candidate-files/{sessionId}`
+- Purpose: let the agent `read` reviewed content and let you inspect/edit proposals with normal editor workflows
+- Lifecycle:
+  - created during review/replan flows for `write` and some `edit` cases
+  - removed when the related review loop is cleared
+  - removed on process exit and interrupt/terminate signals
+  - stale session folders are garbage-collected (currently after ~24h)
+- Permissions:
+  - candidate/session directories: `0700`
+  - candidate files: `0600`
+
+These files are treated as ephemeral review artifacts, not source-of-truth project files.
+
 ## Agent prompt behavior
 
 This extension re-registers the `edit` and `write` tools with stronger guidance.
