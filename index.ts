@@ -1,70 +1,48 @@
 import {
   createEditToolDefinition,
   createWriteToolDefinition,
-  type EditToolInput,
   type ExtensionAPI,
   type ExtensionContext,
-  type WriteToolInput,
 } from "@mariozechner/pi-coding-agent";
-import { Input, Key, matchesKey } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { spawnSync } from "node:child_process";
-import { constants, rmSync } from "node:fs";
-import { access, chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join, resolve } from "node:path";
-import { normalizePath, pathExists, pushLine, pushWrappedLine } from "./utils";
+import {
+  buildEditedProposalCandidate,
+  clearStaleCandidateDirectories,
+  createCandidateFilesSessionManager,
+  persistEditedProposal,
+  registerCandidateFilesProcessCleanup,
+} from "./candidate-files";
+import {
+  buildEditValidationErrors,
+  buildNativePreviewWarnings,
+  buildPreviewFromNativeEditDiff,
+  buildWriteContentPreview,
+  getNativeEditBlockStatuses,
+  runNativeEditPreview,
+  runNativeWritePreview,
+} from "./diff-preview";
+import { handleReviewAction } from "./review-ui";
+import type { EditBlock, EditInput, NativeEditBlockStatus, ReviewData, WriteInput } from "./review-types";
+import {
+  buildBlockedEditApprovalInstruction,
+  buildEditedProposalInstruction,
+  buildMissingTargetEditInstruction,
+  buildSteeringInstruction,
+  joinPathList,
+} from "./tool-hooks";
+import { normalizePath, pathExists } from "./utils";
 
-type DiffPreviewLineKind = "meta" | "context" | "add" | "remove" | "warning";
-
-type DiffPreviewLine = {
-  kind: DiffPreviewLineKind;
-  text: string;
-};
-
-export type ReviewAction = "approve" | "steer" | "edit" | "deny";
-type ReviewDecision = Exclude<ReviewAction, "steer"> | { action: "steer"; steering: string };
-
-type ReviewData = {
-  toolName: "write" | "edit";
-  path: string;
-  reason: string;
-  summary: string[];
-  changes: Array<{ title: string; lines: DiffPreviewLine[] }>;
-  editPreviewValidation?: {
-    canApprove: boolean;
-    errors: string[];
-    missingTarget?: boolean;
-  };
-};
+export { clearCandidateFilesDirectory } from "./candidate-files";
+export { buildReviewBodyLines } from "./review-ui";
+export { buildSteeringInstruction } from "./tool-hooks";
 
 const DIFFLOOP_REVIEW_STATUS = "diffloop";
-const DIFFLOOP_TEMP_ROOT_DIR = join(tmpdir(), "diffloop");
-const CANDIDATE_FILES_ROOT_DIR = join(DIFFLOOP_TEMP_ROOT_DIR, "candidate-files");
-const CANDIDATE_FILES_MAX_AGE_MS = 24 * 60 * 60 * 1000;
-const EPHEMERAL_SESSION_DIR = "ephemeral";
 const baseEditToolDefinition = createEditToolDefinition(process.cwd());
 const baseWriteToolDefinition = createWriteToolDefinition(process.cwd());
-const PROCESS_CLEANUP_REGISTERED_KEY = "__diffloopCandidateFilesCleanupRegistered";
-const PROCESS_CLEANUP_DIRECTORIES_KEY = "__diffloopCandidateFilesCleanupDirectories";
-
-type GlobalCleanupState = typeof globalThis & {
-  [PROCESS_CLEANUP_REGISTERED_KEY]?: boolean;
-  [PROCESS_CLEANUP_DIRECTORIES_KEY]?: Set<string>;
-};
-
-type EditBlock = EditToolInput["edits"][number];
-type EditInput = EditToolInput & { reason: string };
-type WriteInput = WriteToolInput & { reason: string };
-
-type NativeEditPreviewResult = { ok: true; diff?: string } | { ok: false; error: string; diff?: string };
-
-type NativeEditBlockStatus = {
-  index: number;
-  ok: boolean;
-  kind?: "notFound" | "notUnique" | "invalid";
-  error?: string;
-};
 
 const EditParams = Type.Object(
   {
@@ -141,103 +119,6 @@ function resolveExecutionRoot(ctx: ExtensionContext | undefined): string {
   return process.cwd();
 }
 
-function sanitizeSessionDirectoryName(value: string): string {
-  return value.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 80) || EPHEMERAL_SESSION_DIR;
-}
-
-function resolveSessionDirectoryName(ctx: ExtensionContext | undefined): string {
-  const rawSessionFile = ctx?.sessionManager?.getSessionFile?.();
-  if (!rawSessionFile || typeof rawSessionFile !== "string") {
-    return EPHEMERAL_SESSION_DIR;
-  }
-
-  const lastSegment = rawSessionFile.split(/[\\/]/).pop() || rawSessionFile;
-  const fileWithoutExt = lastSegment.replace(/\.[^.]+$/, "");
-  return sanitizeSessionDirectoryName(fileWithoutExt);
-}
-
-function clearCandidateFilesDirectorySync(directory = DIFFLOOP_TEMP_ROOT_DIR) {
-  try {
-    rmSync(directory, { recursive: true, force: true });
-  } catch {
-  }
-}
-
-export async function clearCandidateFilesDirectory(directory = DIFFLOOP_TEMP_ROOT_DIR) {
-  try {
-    await rm(directory, { recursive: true, force: true });
-  } catch {
-  }
-}
-
-function getTrackedCleanupDirectories(state: GlobalCleanupState): Set<string> {
-  if (!state[PROCESS_CLEANUP_DIRECTORIES_KEY]) {
-    state[PROCESS_CLEANUP_DIRECTORIES_KEY] = new Set<string>();
-  }
-  return state[PROCESS_CLEANUP_DIRECTORIES_KEY]!;
-}
-
-function trackCleanupDirectory(directory: string) {
-  const state = globalThis as GlobalCleanupState;
-  getTrackedCleanupDirectories(state).add(directory);
-}
-
-function untrackCleanupDirectory(directory: string) {
-  const state = globalThis as GlobalCleanupState;
-  getTrackedCleanupDirectories(state).delete(directory);
-}
-
-async function clearStaleCandidateDirectories(
-  rootDirectory = CANDIDATE_FILES_ROOT_DIR,
-  maxAgeMs = CANDIDATE_FILES_MAX_AGE_MS,
-) {
-  let entries;
-  try {
-    entries = await readdir(rootDirectory, { withFileTypes: true, encoding: "utf8" });
-  } catch (error: any) {
-    if (error?.code === "ENOENT") return;
-    return;
-  }
-
-  const now = Date.now();
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-
-    const absolutePath = join(rootDirectory, entry.name);
-    let entryStats;
-    try {
-      entryStats = await stat(absolutePath);
-    } catch {
-      continue;
-    }
-
-    if (now - entryStats.mtimeMs < maxAgeMs) continue;
-    await clearCandidateFilesDirectory(absolutePath);
-  }
-}
-
-function registerCandidateFilesProcessCleanup() {
-  const state = globalThis as GlobalCleanupState;
-  if (state[PROCESS_CLEANUP_REGISTERED_KEY]) return;
-
-  state[PROCESS_CLEANUP_REGISTERED_KEY] = true;
-
-  const runCleanup = () => {
-    for (const directory of getTrackedCleanupDirectories(state)) {
-      clearCandidateFilesDirectorySync(directory);
-    }
-  };
-
-  process.once("exit", runCleanup);
-  process.once("SIGINT", () => {
-    runCleanup();
-    process.exit(130);
-  });
-  process.once("SIGTERM", () => {
-    runCleanup();
-    process.exit(143);
-  });
-}
 
 export default function reviewChanges(pi: ExtensionAPI) {
   registerCandidateFilesProcessCleanup();
@@ -247,50 +128,13 @@ export default function reviewChanges(pi: ExtensionAPI) {
   const pendingReadPaths = new Set<string>();
   let pendingEditedProposalPath: string | undefined;
   let pendingEditedProposalReadToolCallId: string | undefined;
-  let candidateFilesDirectory: string | undefined;
-  let sessionDirectoryName = EPHEMERAL_SESSION_DIR;
   let denyHold = false;
-
-  const ensureCandidateFilesDirectory = async (ctx?: ExtensionContext): Promise<string> => {
-    if (ctx) {
-      sessionDirectoryName = resolveSessionDirectoryName(ctx);
-    }
-
-    if (candidateFilesDirectory) return candidateFilesDirectory;
-
-    await mkdir(DIFFLOOP_TEMP_ROOT_DIR, { recursive: true, mode: 0o700 });
-    await mkdir(CANDIDATE_FILES_ROOT_DIR, { recursive: true, mode: 0o700 });
-    try {
-      await chmod(DIFFLOOP_TEMP_ROOT_DIR, 0o700);
-      await chmod(CANDIDATE_FILES_ROOT_DIR, 0o700);
-    } catch {
-    }
-
-    const sessionDir = join(CANDIDATE_FILES_ROOT_DIR, sessionDirectoryName);
-    await mkdir(sessionDir, { recursive: true, mode: 0o700 });
-    try {
-      await chmod(sessionDir, 0o700);
-    } catch {
-    }
-
-    candidateFilesDirectory = sessionDir;
-    trackCleanupDirectory(sessionDir);
-    return sessionDir;
-  };
-
-  const clearSessionCandidateFiles = async () => {
-    if (!candidateFilesDirectory) return;
-
-    const currentDirectory = candidateFilesDirectory;
-    candidateFilesDirectory = undefined;
-    untrackCleanupDirectory(currentDirectory);
-    await clearCandidateFilesDirectory(currentDirectory);
-  };
+  const candidateFiles = createCandidateFilesSessionManager();
 
   const clearPendingEditedProposal = async () => {
     pendingEditedProposalPath = undefined;
     pendingEditedProposalReadToolCallId = undefined;
-    await clearSessionCandidateFiles();
+    await candidateFiles.clearSessionDirectory();
   };
 
   const clearReadRequirements = async () => {
@@ -318,8 +162,8 @@ export default function reviewChanges(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    await clearSessionCandidateFiles();
-    sessionDirectoryName = resolveSessionDirectoryName(ctx);
+    await candidateFiles.clearSessionDirectory();
+    candidateFiles.setSessionFromContext(ctx);
     await clearStaleCandidateDirectories();
     displayDiffloopStatus(ctx, enabled);
   });
@@ -452,13 +296,13 @@ export default function reviewChanges(pi: ExtensionAPI) {
 
       let writeCandidatePath: string | undefined;
       if (event.toolName === "write") {
-        await clearSessionCandidateFiles();
+        await candidateFiles.clearSessionDirectory();
         writeCandidatePath = await persistEditedProposal(
           ctx.cwd,
           "write",
           input.path,
           input as WriteInput,
-          await ensureCandidateFilesDirectory(ctx),
+          await candidateFiles.ensureDirectory(ctx),
         );
       }
 
@@ -481,7 +325,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
               "edit",
               review.path,
               input as EditInput,
-              await ensureCandidateFilesDirectory(ctx),
+              await candidateFiles.ensureDirectory(ctx),
             );
             pendingEditedProposalPath = missingTargetCandidatePath;
             pendingReadPaths.add(missingTargetCandidatePath);
@@ -537,7 +381,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
         event.toolName,
         review.path,
         updated,
-        await ensureCandidateFilesDirectory(ctx),
+        await candidateFiles.ensureDirectory(ctx),
       );
       const requireTargetRead = await pathExists(resolve(ctx.cwd, review.path));
       pendingEditedProposalPath = editedProposalPath;
@@ -693,467 +537,7 @@ async function buildReviewData(
   };
 }
 
-async function handleReviewAction(ctx: ExtensionContext, review: ReviewData): Promise<ReviewDecision> {
-  return ctx.ui.custom<ReviewDecision>(
-    (tui, theme, _keybindings, done) => {
-      const actions: ReviewAction[] = ["approve", "steer", "edit", "deny"];
-      let selected = 0;
-      let steeringMode = false;
-      let steeringError: string | undefined;
-      let focused = false;
-      let previewScrollOffset = 0;
-      let lastContentLineCount = 0;
-      let lastVisibleContentRows = 1;
-      const steeringInput = new Input();
 
-      const actionLabel = (action: ReviewAction) => {
-        if (actions[selected] === action) {
-          return theme.bg("selectedBg", theme.fg("text", action));
-        }
-        if (action === "approve") return theme.fg("success", action);
-        if (action === "steer") return theme.fg("warning", action);
-        if (action === "edit") return theme.fg("accent", action);
-        return theme.fg("error", action);
-      };
-
-      const setSteeringMode = (enabled: boolean) => {
-        steeringMode = enabled;
-        steeringError = undefined;
-        if (!enabled) {
-          steeringInput.setValue("");
-        }
-        steeringInput.focused = enabled && focused;
-      };
-
-      const clampPreviewScroll = () => {
-        const maxOffset = Math.max(0, lastContentLineCount - lastVisibleContentRows);
-        previewScrollOffset = Math.max(0, Math.min(previewScrollOffset, maxOffset));
-        return maxOffset;
-      };
-
-      const scrollPreview = (delta: number) => {
-        const maxOffset = clampPreviewScroll();
-        if (maxOffset === 0) return false;
-
-        const nextOffset = Math.max(0, Math.min(previewScrollOffset + delta, maxOffset));
-        if (nextOffset === previewScrollOffset) return false;
-
-        previewScrollOffset = nextOffset;
-        return true;
-      };
-
-      steeringInput.onSubmit = (value: string) => {
-        const steering = value.trim();
-        if (!steering) {
-          steeringError = "Enter steering instructions or press Esc to cancel.";
-          tui.requestRender();
-          return;
-        }
-        done({ action: "steer", steering });
-      };
-
-      steeringInput.onEscape = () => {
-        setSteeringMode(false);
-        tui.requestRender();
-      };
-
-      const buildHeaderLines = (width: number) => {
-        const headerLines: string[] = [];
-        const innerWidth = Math.max(20, width - 2);
-        const divider = theme.fg("borderAccent", "─".repeat(innerWidth));
-
-        pushLine(headerLines, width, divider);
-        pushWrappedLine(headerLines, width, theme.fg("dim", theme.bold(`Review ${review.toolName}: ${review.path}`)));
-        pushWrappedLine(headerLines, width, theme.fg("accent", `Why: ${review.reason}`));
-        headerLines.push("");
-
-        return { headerLines, divider };
-      };
-
-      return {
-        get focused() {
-          return focused;
-        },
-
-        set focused(value: boolean) {
-          focused = value;
-          steeringInput.focused = steeringMode && value;
-        },
-
-        handleInput(data: string) {
-          if (steeringMode) {
-            steeringInput.handleInput(data);
-            tui.requestRender();
-            return;
-          }
-
-          if (matchesKey(data, Key.left) || matchesKey(data, Key.shift("tab"))) {
-            selected = (selected - 1 + actions.length) % actions.length;
-            tui.requestRender();
-            return;
-          }
-
-          if (matchesKey(data, Key.right) || matchesKey(data, Key.tab)) {
-            selected = (selected + 1) % actions.length;
-            tui.requestRender();
-            return;
-          }
-
-          if (matchesKey(data, Key.up) || matchesKey(data, Key.shift("up")) || data === "k") {
-            if (scrollPreview(-1)) tui.requestRender();
-            return;
-          }
-
-          if (matchesKey(data, Key.down) || matchesKey(data, Key.shift("down")) || data === "j") {
-            if (scrollPreview(1)) tui.requestRender();
-            return;
-          }
-
-          if (matchesKey(data, Key.pageUp)) {
-            if (scrollPreview(-Math.max(1, lastVisibleContentRows - 1))) tui.requestRender();
-            return;
-          }
-
-          if (matchesKey(data, Key.pageDown)) {
-            if (scrollPreview(Math.max(1, lastVisibleContentRows - 1))) tui.requestRender();
-            return;
-          }
-
-          if (matchesKey(data, Key.home)) {
-            if (previewScrollOffset !== 0) {
-              previewScrollOffset = 0;
-              tui.requestRender();
-            }
-            return;
-          }
-
-          if (matchesKey(data, Key.end)) {
-            const maxOffset = clampPreviewScroll();
-            if (previewScrollOffset !== maxOffset) {
-              previewScrollOffset = maxOffset;
-              tui.requestRender();
-            }
-            return;
-          }
-
-          if (matchesKey(data, Key.enter)) {
-            const action = actions[selected];
-            if (action === "steer") {
-              setSteeringMode(true);
-              tui.requestRender();
-              return;
-            }
-
-            done(action);
-            return;
-          }
-
-          if (matchesKey(data, Key.escape)) {
-            done("deny");
-          }
-        },
-
-        invalidate() {
-          steeringInput.invalidate();
-        },
-
-        render(width: number) {
-          const { headerLines, divider } = buildHeaderLines(width);
-          const bodyLines = buildReviewBodyLines(review, width, theme);
-          const contentLines = [...headerLines, ...bodyLines];
-
-          const buildFooterLines = (hint: string) => {
-            const lines: string[] = [];
-            pushLine(
-              lines,
-              width,
-              `${actionLabel("approve")} ${actionLabel("steer")}  ${actionLabel("edit")}  ${actionLabel("deny")}`,
-            );
-            pushWrappedLine(lines, width, theme.fg("dim", hint));
-            if (steeringMode) {
-              lines.push("");
-              pushWrappedLine(lines, width, theme.fg("warning", theme.bold("Steering feedback")));
-              pushWrappedLine(
-                lines,
-                width,
-                theme.fg(
-                  "dim",
-                  "Describe what should change, what should stay the same, and any behavior constraints.",
-                ),
-              );
-              lines.push(...steeringInput.render(width));
-              if (steeringError) {
-                pushWrappedLine(lines, width, theme.fg("warning", steeringError));
-              }
-            }
-            pushLine(lines, width, divider);
-            return lines;
-          };
-
-          let hint = steeringMode
-            ? "Type steering feedback below • Enter send • Esc cancel"
-            : "←/→ choose • ↑/↓ or j/k scroll • Enter confirm • Esc deny";
-
-          let footerLines = buildFooterLines(hint);
-
-          for (let i = 0; i < 2; i++) {
-            const availableRows = Math.max(1, tui.terminal.rows - footerLines.length);
-            lastContentLineCount = contentLines.length;
-            lastVisibleContentRows = availableRows;
-            const maxOffset = clampPreviewScroll();
-            const isScrollable = maxOffset > 0;
-            const visibleStart = previewScrollOffset + 1;
-            const visibleEnd = Math.min(contentLines.length, previewScrollOffset + availableRows);
-
-            const nextHint = steeringMode
-              ? "Type steering feedback below • Enter send • Esc cancel"
-              : isScrollable
-                ? `←/→ choose • ↑/↓ or j/k scroll • PgUp/PgDn page • Home/End jump (${visibleStart}-${visibleEnd}/${contentLines.length})`
-                : "←/→ choose • Enter confirm • Esc deny";
-
-            if (nextHint === hint) break;
-            hint = nextHint;
-            footerLines = buildFooterLines(hint);
-          }
-
-          const availableRows = Math.max(1, tui.terminal.rows - footerLines.length);
-          lastContentLineCount = contentLines.length;
-          lastVisibleContentRows = availableRows;
-          clampPreviewScroll();
-
-          const visibleContent = contentLines.slice(previewScrollOffset, previewScrollOffset + availableRows);
-          return [...visibleContent, ...footerLines];
-        },
-      };
-    },
-    {
-      overlay: true,
-      overlayOptions: {
-        anchor: "bottom-center",
-        width: "100%",
-        maxHeight: "100%",
-        margin: 0,
-      },
-    },
-  );
-}
-
-export function buildSteeringInstruction(
-  toolName: "write" | "edit",
-  path: string,
-  steering: string,
-  candidatePath?: string,
-): string | undefined {
-  const feedback = steering.trim();
-  if (!feedback) return undefined;
-
-  const normalizedPath = normalizePath(path);
-  return [
-    `Revise ${toolName} for ${normalizedPath}.`,
-    `Feedback: ${feedback}`,
-    toolName === "write" && candidatePath ? `If ${normalizedPath} is missing, read ${candidatePath}.` : undefined,
-    candidatePath ? "Candidate files are draft-only; verify repo context before proposing." : undefined,
-    "Submit one revised edit/write proposal if still needed.",
-  ]
-    .filter((line): line is string => Boolean(line))
-    .join("\n");
-}
-
-function buildEditedProposalInstruction(
-  toolName: "write" | "edit",
-  path: string,
-  editedProposalPath: string,
-  requireTargetRead: boolean,
-): string {
-  const normalizedPath = normalizePath(path);
-  return [
-    `Replace the previous ${toolName} proposal for ${normalizedPath}.`,
-    requireTargetRead
-      ? `Read ${normalizedPath} and ${editedProposalPath}.`
-      : `Read ${editedProposalPath}. ${normalizedPath} does not exist yet.`,
-    `Use ${editedProposalPath} as the candidate source.`,
-    "Candidate is draft-only; reconcile with repository dependencies/callers.",
-    "Submit one updated edit/write proposal.",
-  ].join("\n");
-}
-
-function joinPathList(paths: string[]): string {
-  if (paths.length === 0) return "required files";
-  if (paths.length === 1) return paths[0]!;
-  if (paths.length === 2) return `${paths[0]} and ${paths[1]}`;
-  return `${paths.slice(0, -1).join(", ")}, and ${paths[paths.length - 1]}`;
-}
-
-type NativeEditCandidateResult = { ok: true; content: string } | { ok: false; error: string };
-
-async function runNativeEditCandidate(cwd: string, path: string, edits: EditBlock[]): Promise<NativeEditCandidateResult> {
-  let candidateContent: string | undefined;
-
-  const nativeEdit = createEditToolDefinition(cwd, {
-    operations: {
-      async access(absolutePath: string) {
-        await access(absolutePath, constants.R_OK | constants.W_OK);
-      },
-      async readFile(absolutePath: string) {
-        return readFile(absolutePath);
-      },
-      async writeFile(_absolutePath: string, content: string) {
-        candidateContent = content;
-      },
-    },
-  });
-
-  try {
-    await nativeEdit.execute(
-      "diffloop-edited-proposal-candidate",
-      { path, edits },
-      undefined,
-      undefined,
-      undefined as any,
-    );
-    return {
-      ok: true,
-      content: candidateContent ?? "",
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
-}
-
-function applyEditsBestEffort(baseContent: string, edits: EditBlock[]): string {
-  let content = baseContent;
-  for (const edit of edits) {
-    content = content.replace(edit.oldText, edit.newText);
-  }
-  return content;
-}
-
-async function buildEditedProposalCandidate(
-  cwd: string,
-  toolName: "write" | "edit",
-  path: string,
-  input: WriteInput | EditInput,
-): Promise<string> {
-  if (toolName === "write") {
-    const writeInput = input as WriteInput;
-    return writeInput.content;
-  }
-
-  const normalizedPath = normalizePath(path);
-  const editInput = normalizeEditInput(input as EditInput);
-  const previewCandidate = await runNativeEditCandidate(cwd, normalizedPath, editInput.edits);
-  if (previewCandidate.ok) {
-    return previewCandidate.content;
-  }
-
-  const absolutePath = resolve(cwd, normalizedPath);
-  let baseContent = "";
-  try {
-    baseContent = await readFile(absolutePath, "utf8");
-  } catch (error: any) {
-    if (error?.code !== "ENOENT") throw error;
-  }
-
-  return applyEditsBestEffort(baseContent, editInput.edits);
-}
-
-async function persistEditedProposal(
-  cwd: string,
-  toolName: "write" | "edit",
-  path: string,
-  input: WriteInput | EditInput,
-  candidateDirectory: string,
-): Promise<string> {
-  await mkdir(candidateDirectory, { recursive: true, mode: 0o700 });
-
-  const normalizedPath = normalizePath(path);
-  const extension = extname(normalizedPath) || ".txt";
-  const baseName = normalizedPath.split(/[\\/]/).pop() || "file";
-  const baseWithoutExt = baseName.endsWith(extension) ? baseName.slice(0, -extension.length) : baseName;
-  const safeBase = baseWithoutExt.replace(/[^A-Za-z0-9._-]/g, "_") || "file";
-  const timestamp = Date.now();
-  const random = Math.random().toString(36).slice(2, 8);
-  const fileName = `candidate-${safeBase}-${timestamp}-${random}${extension}`;
-  const absolutePath = join(candidateDirectory, fileName);
-  const candidateSource = await buildEditedProposalCandidate(cwd, toolName, normalizedPath, input);
-
-  await writeFile(absolutePath, candidateSource, { encoding: "utf8", mode: 0o600 });
-  return absolutePath;
-}
-
-function buildBlockedEditApprovalInstruction(path: string, input: EditInput, review: ReviewData): string {
-  const normalizedPath = normalizePath(path);
-  const currentReason = typeof input.reason === "string" && input.reason.trim() ? input.reason.trim() : undefined;
-  const validationErrors = review.editPreviewValidation?.errors ?? ["Native preview validation failed."];
-
-  return [
-    `Do not execute the previous edit for ${normalizedPath}.`,
-    `Native preview failed: ${validationErrors.join("; ")}`,
-    currentReason ? `Previous reason: ${currentReason}` : undefined,
-    `Read ${normalizedPath}, then propose a new exact-match edit with unique oldText blocks.`,
-    "If exact matching still fails, switch to write with full file content.",
-  ]
-    .filter((line): line is string => Boolean(line))
-    .join("\n");
-}
-
-function buildMissingTargetEditInstruction(path: string, input: EditInput, candidatePath: string): string {
-  const normalizedPath = normalizePath(path);
-  const currentReason = typeof input.reason === "string" && input.reason.trim() ? input.reason.trim() : undefined;
-
-  return [
-    `Do not execute the previous edit for ${normalizedPath}.`,
-    "Target file is missing, so edit cannot apply.",
-    currentReason ? `Previous reason: ${currentReason}` : undefined,
-    `Read ${candidatePath}.`,
-    "Treat candidate as draft-only; check repo dependencies before final proposal.",
-    `Then submit one write proposal for ${normalizedPath} from that candidate content.`,
-  ]
-    .filter((line): line is string => Boolean(line))
-    .join("\n");
-}
-
-export function buildReviewBodyLines(
-  review: ReviewData,
-  width: number,
-  theme: ExtensionContext["ui"]["theme"],
-): string[] {
-  const lines: string[] = [];
-
-  for (const item of review.summary) {
-    pushWrappedLine(lines, width, theme.fg("dim", `• ${item}`));
-  }
-  if (review.summary.length) {
-    lines.push("");
-  }
-
-  for (const change of review.changes) {
-    pushWrappedLine(lines, width, theme.fg("accent", theme.bold(change.title)));
-    for (const line of change.lines) {
-      const rendered =
-        line.kind === "add"
-          ? theme.fg("success", line.text)
-          : line.kind === "remove"
-            ? theme.fg("error", line.text)
-            : line.kind === "warning"
-              ? theme.fg("warning", line.text)
-              : line.kind === "meta"
-                ? theme.fg("accent", line.text)
-                : theme.fg("dim", line.text);
-      pushWrappedLine(lines, width, rendered);
-    }
-    lines.push("");
-  }
-
-  if (lines.length === 0) {
-    pushWrappedLine(lines, width, theme.fg("dim", "No changes to preview."));
-  }
-
-  return lines;
-}
 
 async function editProposal(
   ctx: ExtensionContext,
@@ -1312,207 +696,6 @@ async function openProposalInEditor(
   }
 }
 
-async function runNativeEditPreview(cwd: string, path: string, edits: EditBlock[]): Promise<NativeEditPreviewResult> {
-  const nativeEdit = createEditToolDefinition(cwd, {
-    operations: {
-      async access(absolutePath: string) {
-        await access(absolutePath, constants.R_OK | constants.W_OK);
-      },
-      async readFile(absolutePath: string) {
-        return readFile(absolutePath);
-      },
-      async writeFile(_absolutePath: string, _content: string) {
-        // Prevent disk writes during preview. Native edit still computes details.diff.
-      },
-    },
-  });
-
-  try {
-    const result = await nativeEdit.execute(
-      "diffloop-native-preview",
-      { path, edits },
-      undefined,
-      undefined,
-      undefined as any,
-    );
-    return {
-      ok: true,
-      diff: result.details?.diff,
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
-}
-
-type NativeWritePreviewResult = { ok: true } | { ok: false; error: string };
-
-async function runNativeWritePreview(cwd: string, path: string, content: string): Promise<NativeWritePreviewResult> {
-  const nativeWrite = createWriteToolDefinition(cwd, {
-    operations: {
-      async mkdir(_dir: string) {
-        // Preview only; directory creation is skipped.
-      },
-      async writeFile(_absolutePath: string, _content: string) {
-        // Preview only; disk writes are intentionally skipped.
-      },
-    },
-  });
-
-  try {
-    await nativeWrite.execute(
-      "diffloop-native-write-preview",
-      { path, content },
-      undefined,
-      undefined,
-      undefined as any,
-    );
-    return { ok: true };
-  } catch (error) {
-    return {
-      ok: false,
-      error: error instanceof Error ? error.message : String(error),
-    };
-  }
-}
-
-function buildPreviewFromNativeEditDiff(diff: string) {
-  const lines: DiffPreviewLine[] = [];
-  let additions = 0;
-  let removals = 0;
-  let hunks = 0;
-
-  for (const line of diff.replace(/\n$/, "").split("\n")) {
-    if (!line || line.startsWith("--- ") || line.startsWith("+++ ") || line.startsWith("===")) continue;
-
-    if (line.startsWith("@@")) {
-      hunks++;
-      lines.push({ kind: "meta", text: line });
-      continue;
-    }
-
-    if (line.startsWith("+") && !line.startsWith("+++")) {
-      additions++;
-      lines.push({ kind: "add", text: line });
-      continue;
-    }
-
-    if (line.startsWith("-") && !line.startsWith("---")) {
-      removals++;
-      lines.push({ kind: "remove", text: line });
-      continue;
-    }
-
-    if (line.startsWith("\\ ")) {
-      lines.push({ kind: "meta", text: line });
-      continue;
-    }
-
-    lines.push({ kind: "context", text: line });
-  }
-
-  if (lines.length === 0) {
-    lines.push({ kind: "meta", text: "No textual changes to preview." });
-  }
-
-  return {
-    lines,
-    additions,
-    removals,
-    hunks,
-    hasChanges: additions > 0 || removals > 0,
-  };
-}
-
-function buildWriteContentPreview(content: string): DiffPreviewLine[] {
-  if (content.length === 0) {
-    return [{ kind: "meta", text: "(empty file)" }];
-  }
-
-  const lines = content.split("\n");
-  return lines.map((line) => ({ kind: "add", text: `+${line}` }));
-}
-
-async function getNativeEditBlockStatuses(
-  cwd: string,
-  path: string,
-  edits: EditBlock[],
-): Promise<NativeEditBlockStatus[]> {
-  return Promise.all(
-    edits.map(async (edit, index) => {
-      const preview = await runNativeEditPreview(cwd, path, [edit]);
-      if (preview.ok) {
-        return { index, ok: true };
-      }
-      return {
-        index,
-        ok: false,
-        kind: classifyNativeEditError(preview.error),
-        error: preview.error,
-      };
-    }),
-  );
-}
-
-function classifyNativeEditError(error: string): NativeEditBlockStatus["kind"] {
-  if (error.includes("must be unique") || error.includes("must be empty") || error.includes("occurrences")) {
-    return "notUnique";
-  }
-  if (error.includes("Could not find") || error.includes("File not found")) {
-    return "notFound";
-  }
-  return "invalid";
-}
-
-function buildEditValidationErrors(blockStatuses: NativeEditBlockStatus[], previewError?: string): string[] {
-  const notFound = blockStatuses.filter((status) => !status.ok && status.kind === "notFound").length;
-  const notUnique = blockStatuses.filter((status) => !status.ok && status.kind === "notUnique").length;
-  const invalid = blockStatuses.filter((status) => !status.ok && status.kind === "invalid").length;
-
-  const errors: string[] = [];
-  if (notFound > 0) {
-    errors.push(`${notFound} block(s) did not match the current file content.`);
-  }
-  if (notUnique > 0) {
-    errors.push(`${notUnique} block(s) matched multiple locations; oldText must be unique.`);
-  }
-  if (invalid > 0) {
-    errors.push(`${invalid} block(s) were rejected by native preview validation.`);
-  }
-  if (previewError) {
-    errors.push(previewError);
-  }
-
-  return errors;
-}
-
-function buildNativePreviewWarnings(status: NativeEditBlockStatus): DiffPreviewLine[] {
-  if (status.ok) return [];
-  if (status.kind === "notFound") {
-    return [
-      {
-        kind: "warning",
-        text: `! Edit block ${status.index + 1} oldText was not found by Pi's native edit tool.`,
-      },
-    ];
-  }
-  if (status.kind === "notUnique") {
-    return [
-      {
-        kind: "warning",
-        text: `! Edit block ${status.index + 1} oldText is not unique in the current file and will fail at execution time.`,
-      },
-    ];
-  }
-  return [
-    {
-      kind: "warning",
-      text: `! Edit block ${status.index + 1} could not be validated by Pi: ${status.error}`,
-    },
-  ];
-}
 
 function describeEditBlockOption(edit: EditBlock, index: number, status?: NativeEditBlockStatus): string {
   const preview = summarizeCodeSnippet(edit.newText || edit.oldText);
