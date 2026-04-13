@@ -2,7 +2,7 @@
 
 `diffloop` is a Pi extension that slows down the agentic coding workflow on purpose by presenting each code change to the developer, with a reason attached to it.
 
-![image](./assets/image.png)
+![](https://github-production-user-asset-6210df.s3.amazonaws.com/81486152/577153268-5c3690da-9239-41b0-93d3-8540a67f0500.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAVCODYLSA53PQK4ZA%2F20260413%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20260413T034035Z&X-Amz-Expires=300&X-Amz-Signature=947641d0e2b8a9d4d241ea355b640c3d1fc01c3076c5ce7afa95777022db9576&X-Amz-SignedHeaders=host&response-content-type=image%2Fpng)
 
 ## What it does
 
@@ -57,6 +57,30 @@ When the agent proposes an `edit` or `write`:
 2. it builds a preview of the change
 3. it opens a review UI
 4. you choose one of the available actions
+
+## Review scope (optional)
+
+By default, diffloop reviews all `edit` and `write` proposals.
+
+You can scope review to specific files using env vars:
+
+- `DIFFLOOP_REVIEW_INCLUDE` — comma-separated glob patterns to include
+- `DIFFLOOP_REVIEW_EXCLUDE` — comma-separated glob patterns to exclude
+- `DIFFLOOP_REVIEW_INCLUDE_EXTENSIONS` — comma-separated extensions to include (e.g. `.ts,.tsx`)
+- `DIFFLOOP_REVIEW_EXCLUDE_EXTENSIONS` — comma-separated extensions to exclude (e.g. `.lock,.snap`)
+
+Examples:
+
+```bash
+# Review only TypeScript files
+export DIFFLOOP_REVIEW_INCLUDE="*.ts,*.tsx"
+
+# Or use extension filters directly
+export DIFFLOOP_REVIEW_INCLUDE_EXTENSIONS=".ts,.tsx"
+export DIFFLOOP_REVIEW_EXCLUDE_EXTENSIONS=".lock"
+```
+
+Out-of-scope paths bypass diffloop review and run through Pi's normal tool execution.
 
 ## Candidate files (temporary review artifacts)
 

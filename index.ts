@@ -26,6 +26,7 @@ import {
   runNativeWritePreview,
 } from "./diff-preview";
 import { handleReviewAction } from "./review-ui";
+import { createReviewScopeFromEnv, isPathInReviewScope } from "./review-scope";
 import type { EditBlock, EditInput, NativeEditBlockStatus, ReviewData, WriteInput } from "./review-types";
 import {
   buildBlockedEditApprovalInstruction,
@@ -125,6 +126,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
   void clearStaleCandidateDirectories();
 
   let enabled = true;
+  const reviewScope = createReviewScopeFromEnv();
   const pendingReadPaths = new Set<string>();
   let pendingEditedProposalPath: string | undefined;
   let pendingEditedProposalReadToolCallId: string | undefined;
@@ -277,6 +279,11 @@ export default function reviewChanges(pi: ExtensionAPI) {
       }
 
       const input = event.input as WriteInput | EditInput;
+      const normalizedInputPath = normalizePath(input.path || "");
+      if (!isPathInReviewScope(normalizedInputPath, reviewScope)) {
+        return undefined;
+      }
+
       if (pendingReadPaths.size > 0) {
         const requiredReadList = Array.from(pendingReadPaths);
         return {

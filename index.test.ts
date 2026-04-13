@@ -319,6 +319,64 @@ describe("reviewChanges", () => {
 		expectBlockedWithReason(result);
 	});
 
+	test("skips review for out-of-scope files via include patterns", async () => {
+		const previousInclude = process.env.DIFFLOOP_REVIEW_INCLUDE;
+		process.env.DIFFLOOP_REVIEW_INCLUDE = "*.ts";
+
+		try {
+			const toolCall = registerToolCallHandler();
+			const outOfScope = await toolCall(
+				{
+					toolName: "write",
+					input: {
+						path: "@notes.lock",
+						content: "first draft",
+					},
+				},
+				{
+					hasUI: true,
+					cwd: process.cwd(),
+					isIdle: () => true,
+					ui: {
+						custom: async () => {
+							throw new Error("out-of-scope files should bypass review UI");
+						},
+						notify() {},
+					},
+				} as any,
+			);
+			expect(outOfScope).toBeUndefined();
+
+			const inScope = await toolCall(
+				{
+					toolName: "write",
+					input: {
+						path: "@src/file.ts",
+						content: "first draft",
+					},
+				},
+				{
+					hasUI: true,
+					cwd: process.cwd(),
+					isIdle: () => true,
+					ui: {
+						custom: async () => {
+							throw new Error("in-scope missing reason should block before review UI");
+						},
+						notify() {},
+					},
+				} as any,
+			);
+			expectBlockedWithReason(inScope);
+		} finally {
+			if (previousInclude === undefined) {
+				delete process.env.DIFFLOOP_REVIEW_INCLUDE;
+			} else {
+				process.env.DIFFLOOP_REVIEW_INCLUDE = previousInclude;
+			}
+		}
+	});
+
 	test("creates a candidate file when reviewing write proposals", async () => {
 		const { toolCall } = createReviewHarness();
 		const directory = await mkdtemp(join(tmpdir(), "diffloop-write-candidate-"));
