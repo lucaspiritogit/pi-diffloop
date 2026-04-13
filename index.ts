@@ -952,6 +952,7 @@ export function buildSteeringInstruction(
     `Revise ${toolName} for ${normalizedPath}.`,
     `Feedback: ${feedback}`,
     toolName === "write" && candidatePath ? `If ${normalizedPath} is missing, read ${candidatePath}.` : undefined,
+    candidatePath ? "Candidate files are draft-only; verify repo context before proposing." : undefined,
     "Submit one revised edit/write proposal if still needed.",
   ]
     .filter((line): line is string => Boolean(line))
@@ -971,6 +972,7 @@ function buildEditedProposalInstruction(
       ? `Read ${normalizedPath} and ${editedProposalPath}.`
       : `Read ${editedProposalPath}. ${normalizedPath} does not exist yet.`,
     `Use ${editedProposalPath} as the candidate source.`,
+    "Candidate is draft-only; reconcile with repository dependencies/callers.",
     "Submit one updated edit/write proposal.",
   ].join("\n");
 }
@@ -1107,6 +1109,7 @@ function buildMissingTargetEditInstruction(path: string, input: EditInput, candi
     "Target file is missing, so edit cannot apply.",
     currentReason ? `Previous reason: ${currentReason}` : undefined,
     `Read ${candidatePath}.`,
+    "Treat candidate as draft-only; check repo dependencies before final proposal.",
     `Then submit one write proposal for ${normalizedPath} from that candidate content.`,
   ]
     .filter((line): line is string => Boolean(line))
