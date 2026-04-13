@@ -21,7 +21,7 @@ For each proposed file change, diffloop:
 ## Installation
 
 ```sh
-npm i @lpirito/pi-diffloop
+pi install npm:@lpirito/pi-diffloop
 ```
 
 ## Why use it
