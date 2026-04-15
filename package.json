@@ -10,7 +10,7 @@
     "test": "bun test",
     "check": "bun run build && bun run typecheck && bun run test",
     "release:dry": "bun run check && bun publish --dry-run",
-    "release": "npm version patch && bun run check && bun publish --access public",
+    "release": "bun run check && npm version patch && bun publish --access public",
     "release:patch": "npm version patch && npm publish --access public"
   },
   "files": [
