@@ -1,6 +1,4 @@
 import {
-  createEditToolDefinition,
-  createWriteToolDefinition,
   type ExtensionAPI,
   type ExtensionContext,
 } from "@mariozechner/pi-coding-agent";
@@ -43,28 +41,9 @@ export { buildReviewBodyLines } from "./review-ui";
 export { buildSteeringInstruction } from "./tool-hooks";
 
 const DIFFLOOP_REVIEW_STATUS = "diffloop";
-const baseEditToolDefinition = createEditToolDefinition(process.cwd());
-const baseWriteToolDefinition = createWriteToolDefinition(process.cwd());
-
-const EditParams = Type.Object(
-  {
-    ...baseEditToolDefinition.parameters.properties,
-    reason: Type.String({
-      description: "Why this edit is needed for review.",
-    }),
-  },
-  { additionalProperties: false },
-);
-
-const WriteParams = Type.Object(
-  {
-    ...baseWriteToolDefinition.parameters.properties,
-    reason: Type.String({
-      description: "Why this write is needed for review.",
-    }),
-  },
-  { additionalProperties: false },
-);
+const DIFFLOOP_REASON_TOOL_NAME = "set_change_reason";
+const DIFFLOOP_REASON_GUIDANCE =
+  `Before every edit/write tool call, call ${DIFFLOOP_REASON_TOOL_NAME} first with one concrete reason tied to repository context and behavior impact.`;
 
 export function normalizeEditArguments(args: any) {
   if (!args || typeof args !== "object") return args;
@@ -102,25 +81,9 @@ export function normalizeEditArguments(args: any) {
   return args;
 }
 
-export function normalizeWriteArguments(args: any) {
-  if (!args || typeof args !== "object") return args;
-
-  const input = args as { path?: string; content?: string; reason?: string };
-
-  return {
-    path: normalizePath(input.path || ""),
-    content: typeof input.content === "string" ? input.content : "",
-    reason: typeof input.reason === "string" ? input.reason.trim() : "",
-  };
+function normalizeReasonValue(reason: unknown): string {
+  return typeof reason === "string" ? reason.trim() : "";
 }
-
-function resolveExecutionRoot(ctx: ExtensionContext | undefined): string {
-  if (ctx && typeof ctx.cwd === "string" && ctx.cwd.length > 0) {
-    return ctx.cwd;
-  }
-  return process.cwd();
-}
-
 
 export default function reviewChanges(pi: ExtensionAPI) {
   registerCandidateFilesProcessCleanup();
@@ -154,6 +117,29 @@ export default function reviewChanges(pi: ExtensionAPI) {
     }
   };
 
+  const pendingChangeReasons: string[] = [];
+
+  const clearPendingChangeReasons = () => {
+    pendingChangeReasons.length = 0;
+  };
+
+  const queuePendingChangeReason = (reason: unknown): boolean => {
+    const normalizedReason = normalizeReasonValue(reason);
+    if (!normalizedReason) return false;
+
+    pendingChangeReasons.push(normalizedReason);
+    return true;
+  };
+
+  const consumePendingChangeReason = (): string | undefined => {
+    while (pendingChangeReasons.length > 0) {
+      const reason = normalizeReasonValue(pendingChangeReasons.shift());
+      if (reason) return reason;
+    }
+
+    return undefined;
+  };
+
   pi.registerCommand("diffloop", {
     description: "Set diffloop on, off, toggle it, or show the current status",
     handler: async (args, ctx) => {
@@ -173,7 +159,35 @@ export default function reviewChanges(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool?.({
+    name: DIFFLOOP_REASON_TOOL_NAME,
+    label: DIFFLOOP_REASON_TOOL_NAME,
+    description: "Record the reason for the next edit/write proposal.",
+    promptSnippet: "Record reason before each edit/write",
+    promptGuidelines: [
+      `Before each edit/write call, use ${DIFFLOOP_REASON_TOOL_NAME} with one concrete reason tied to current code.`,
+    ],
+    parameters: Type.Object({
+      reason: Type.String({ description: "Concrete reason for the next file mutation." }),
+    }),
+    async execute(_toolCallId, params: { reason: string }) {
+      return {
+        content: [{ type: "text" as const, text: `Reason recorded: ${params.reason.trim()}` }],
+        details: undefined,
+      };
+    },
+  });
+
+  pi.on("before_agent_start", async (event) => {
+    if (!enabled) return undefined;
+
+    return {
+      systemPrompt: `${event.systemPrompt}\n\n${DIFFLOOP_REASON_GUIDANCE}`,
+    };
+  });
+
   pi.on("session_start", async (_event, ctx) => {
+    clearPendingChangeReasons();
     await candidateFiles.clearSessionDirectory();
     candidateFiles.setSessionFromContext(ctx);
     await clearStaleCandidateDirectories();
@@ -188,6 +202,10 @@ export default function reviewChanges(pi: ExtensionAPI) {
   });
 
   pi.on("input", async (event, ctx) => {
+    if (event.source !== "extension") {
+      clearPendingChangeReasons();
+    }
+
     if (!denyHold) return;
     if (event.source === "extension") return;
 
@@ -198,57 +216,28 @@ export default function reviewChanges(pi: ExtensionAPI) {
     }
   });
 
-  pi.registerTool({
-    ...baseEditToolDefinition,
-    description: "Edit one file using exact oldText/newText blocks. Include a non-empty `reason`.",
-    promptSnippet: "Use edit for precise replacements and include a concrete `reason`.",
-    promptGuidelines: [
-      ...(baseEditToolDefinition.promptGuidelines ?? []),
-      "Keep `reason` specific to this file change and avoid generic prose.",
-    ],
-    parameters: EditParams,
-    prepareArguments: normalizeEditArguments,
-    async execute(toolCallId, params, signal, onUpdate, toolCtx) {
-      const nativeEditTool = createEditToolDefinition(resolveExecutionRoot(toolCtx));
-      return nativeEditTool.execute(
-        toolCallId,
-        {
-          path: normalizePath(params.path),
-          edits: params.edits,
-        },
-        signal,
-        onUpdate,
-        toolCtx,
-      );
-    },
-  });
-
-  pi.registerTool({
-    ...baseWriteToolDefinition,
-    description: "Create or overwrite one file. Include a non-empty `reason`.",
-    promptGuidelines: [
-      ...(baseWriteToolDefinition.promptGuidelines ?? []),
-      "Keep `reason` concrete and file-specific.",
-    ],
-    parameters: WriteParams,
-    prepareArguments: normalizeWriteArguments,
-    async execute(toolCallId, params, signal, onUpdate, toolCtx) {
-      const nativeWriteTool = createWriteToolDefinition(resolveExecutionRoot(toolCtx));
-      return nativeWriteTool.execute(
-        toolCallId,
-        {
-          path: normalizePath(params.path),
-          content: params.content,
-        },
-        signal,
-        onUpdate,
-        toolCtx,
-      );
-    },
-  });
-
   pi.on("tool_call", async (event, ctx) => {
-    if (!enabled || (event.toolName !== "edit" && event.toolName !== "write" && event.toolName !== "read")) {
+    if (
+      !enabled ||
+      (event.toolName !== "edit" &&
+        event.toolName !== "write" &&
+        event.toolName !== "read" &&
+        event.toolName !== DIFFLOOP_REASON_TOOL_NAME)
+    ) {
+      return undefined;
+    }
+
+    if (event.toolName === DIFFLOOP_REASON_TOOL_NAME) {
+      const reason = normalizeReasonValue((event.input as { reason?: unknown } | undefined)?.reason);
+      if (!reason) {
+        return {
+          block: true,
+          reason: `Blocked ${DIFFLOOP_REASON_TOOL_NAME}: include a non-empty reason and retry.`,
+        };
+      }
+
+      queuePendingChangeReason(reason);
+      event.input = { reason };
       return undefined;
     }
 
@@ -271,14 +260,17 @@ export default function reviewChanges(pi: ExtensionAPI) {
         }
       }
 
-      if (pendingReadPaths.size === 0 && ctx.hasUI) {
-        ctx.ui.notify("Read requirements satisfied. Agent may now choose edit/write.", "info");
-      }
       return undefined;
     }
 
+    if (event.toolName !== "edit" && event.toolName !== "write") {
+      return undefined;
+    }
+    const toolName = event.toolName;
+    let resolvedChangeReason: string | undefined;
+
     if (!ctx.hasUI) {
-      return { block: true, reason: `Blocked ${event.toolName}: no interactive UI available for approval` };
+      return { block: true, reason: `Blocked ${toolName}: no interactive UI available for approval` };
     }
 
     while (true) {
@@ -289,34 +281,47 @@ export default function reviewChanges(pi: ExtensionAPI) {
         };
       }
 
-      if (typeof event.input.path === "string") {
-        event.input.path = normalizePath(event.input.path);
+      const proposedInput = normalizeToolCallInput(toolName, event.input);
+      sanitizeToolCallInput(event, toolName, proposedInput);
+      if (!proposedInput.path) {
+        return {
+          block: true,
+          reason: `Blocked ${toolName}: include a valid path and retry.`,
+        };
+      }
+      if (toolName === "edit" && (proposedInput as EditInput).edits.length === 0) {
+        return {
+          block: true,
+          reason: "Blocked edit: include at least one valid oldText/newText edit block and retry.",
+        };
       }
 
-      const proposedInput = event.input as WriteInput | EditInput;
-      const normalizedInputPath = normalizePath(proposedInput.path || "");
+      const normalizedInputPath = proposedInput.path;
       if (!isPathInReviewScope(normalizedInputPath, reviewScope)) {
+        consumePendingChangeReason();
         return undefined;
       }
 
       if (pendingReadPaths.size > 0) {
         return {
           block: true,
-          reason: `Blocked ${event.toolName}: read ${joinPathList(Array.from(pendingReadPaths))} first.`,
+          reason: `Blocked ${toolName}: read ${joinPathList(Array.from(pendingReadPaths))} first.`,
         };
       }
 
-      if (typeof proposedInput.reason !== "string" || !proposedInput.reason.trim()) {
+      if (!resolvedChangeReason) {
+        resolvedChangeReason = normalizeReasonValue(proposedInput.reason) || consumePendingChangeReason();
+      }
+      proposedInput.reason = resolvedChangeReason ?? "";
+      if (!proposedInput.reason) {
         return {
           block: true,
-          reason: `Blocked ${event.toolName}: include a non-empty reason and retry.`,
+          reason: `Blocked ${toolName}: call ${DIFFLOOP_REASON_TOOL_NAME} first with a concrete reason, then retry one ${toolName} proposal.`,
         };
       }
 
-      proposedInput.reason = proposedInput.reason.trim();
-
       let writeCandidatePath: string | undefined;
-      if (event.toolName === "write") {
+      if (toolName === "write") {
         await candidateFiles.clearSessionDirectory();
         writeCandidatePath = await persistEditedProposal(
           ctx.cwd,
@@ -327,7 +332,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
         );
       }
 
-      const review = await buildReviewData(ctx, event.toolName, proposedInput, writeCandidatePath);
+      const review = await buildReviewData(ctx, toolName, proposedInput, writeCandidatePath);
 
       const action = await handleReviewAction(ctx, review);
 
@@ -373,12 +378,12 @@ export default function reviewChanges(pi: ExtensionAPI) {
         ctx.abort();
         return {
           block: true,
-          reason: "Developer denied the proposal. Stop and wait for a new user prompt.",
+          reason: "",
         };
       }
 
       if (typeof action === "object" && action.action === "steer") {
-        const message = buildSteeringInstruction(event.toolName, review.path, action.steering, writeCandidatePath);
+        const message = buildSteeringInstruction(toolName, review.path, action.steering, writeCandidatePath);
         if (!message) {
           ctx.ui.notify("Enter steering instructions to send feedback to the agent.", "warning");
           continue;
@@ -387,7 +392,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
         return { block: true, reason: message };
       }
 
-      const updated = await editProposal(ctx, event.toolName, proposedInput);
+      const updated = await editProposal(ctx, toolName, proposedInput);
       if (!updated) {
         continue;
       }
@@ -395,7 +400,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
       await clearPendingEditedProposal();
       const editedProposalPath = await persistEditedProposal(
         ctx.cwd,
-        event.toolName,
+        toolName,
         review.path,
         updated,
         await candidateFiles.ensureDirectory(ctx),
@@ -405,7 +410,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
       setPendingReadRequirements(requireTargetRead ? review.path : undefined, editedProposalPath);
       return {
         block: true,
-        reason: buildEditedProposalInstruction(event.toolName, review.path, editedProposalPath, requireTargetRead),
+        reason: buildEditedProposalInstruction(toolName, review.path, editedProposalPath, requireTargetRead),
       };
     }
   });
@@ -457,7 +462,7 @@ async function buildReviewData(
   candidatePath?: string,
 ): Promise<ReviewData> {
   const path = normalizePath(input.path);
-  const reason = input.reason.trim();
+  const reason = input.reason.trim() || "(no reason provided)";
   const absolutePath = resolve(ctx.cwd, path);
   let existingContent: string | undefined;
   try {
@@ -772,6 +777,49 @@ export function normalizeEditInput(input: EditInput): EditInput {
     path: normalizePath(input.path),
     reason: input.reason?.trim() ?? "",
     edits,
+  };
+}
+
+function normalizeWriteInput(input: unknown): WriteInput {
+  const raw = (input && typeof input === "object" ? input : {}) as {
+    path?: unknown;
+    content?: unknown;
+    reason?: unknown;
+  };
+
+  return {
+    path: normalizePath(typeof raw.path === "string" ? raw.path : ""),
+    content: typeof raw.content === "string" ? raw.content : "",
+    reason: typeof raw.reason === "string" ? raw.reason.trim() : "",
+  };
+}
+
+function normalizeToolCallInput(toolName: "write" | "edit", input: unknown): WriteInput | EditInput {
+  if (toolName === "write") {
+    return normalizeWriteInput(input);
+  }
+
+  const normalizedEditArgs = normalizeEditArguments(input as any);
+  const raw = (normalizedEditArgs && typeof normalizedEditArgs === "object" ? normalizedEditArgs : {}) as EditInput;
+  return normalizeEditInput(raw);
+}
+
+function sanitizeToolCallInput(
+  event: { input: unknown },
+  toolName: "write" | "edit",
+  normalizedInput: WriteInput | EditInput,
+) {
+  if (toolName === "write") {
+    event.input = {
+      path: normalizedInput.path,
+      content: (normalizedInput as WriteInput).content,
+    };
+    return;
+  }
+
+  event.input = {
+    path: normalizedInput.path,
+    edits: (normalizedInput as EditInput).edits,
   };
 }
 

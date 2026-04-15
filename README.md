@@ -10,7 +10,7 @@ This extension intercepts Pi `edit` and `write` tool calls and replaces the defa
 
 For each proposed file change, diffloop:
 
-- requires the agent to include a `reason`
+- requires a reason (captured through `set_change_reason`)
 - shows a preview before execution
 - lets you:
   - **approve** the change
@@ -101,7 +101,9 @@ These files are treated as ephemeral review artifacts, not source-of-truth proje
 
 ## Agent prompt behavior
 
-This extension re-registers the `edit` and `write` tools with stronger guidance.
+This extension does **not** re-register the `edit` and `write` tools.
+
+Instead, it registers a small helper tool called `set_change_reason` and prompts the agent to call it before each `edit`/`write` proposal.
 
 It pushes the agent to provide reasons that are:
 

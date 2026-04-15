@@ -269,31 +269,57 @@ describe("clearCandidateFilesDirectory", () => {
 });
 
 describe("reviewChanges", () => {
-	test("registers the command, tools, and lifecycle handlers", () => {
+	test("registers the command and lifecycle handlers", () => {
 		const commands: Array<{ name: string; config: unknown }> = [];
-		const tools: Array<any> = [];
 		const handlers = new Map<string, Function>();
 
 		reviewChanges({
 			registerCommand(name: string, config: unknown) {
 				commands.push({ name, config });
 			},
-			registerTool(config: unknown) {
-				tools.push(config);
-			},
+			registerTool() {},
 			on(event: string, handler: Function) {
 				handlers.set(event, handler);
 			},
 		} as any);
 
 		expect(commands.map((command) => command.name)).toEqual(["diffloop"]);
-		expect(tools.map((tool) => tool.name)).toEqual(["edit", "write"]);
-		expect(typeof tools[0].prepareArguments).toBe("function");
 		expect(handlers.has("session_start")).toBe(true);
 		expect(handlers.has("tool_call")).toBe(true);
 	});
 
-	test("blocks tool calls that omit a reason", async () => {
+	test("allows write proposals with inline reason and strips non-native fields", async () => {
+		const toolCall = registerToolCallHandler();
+		const event = {
+			toolName: "write",
+			input: {
+				path: "@notes.txt",
+				content: "first draft",
+				reason: "Create notes",
+			},
+		};
+
+		const result = await toolCall(
+			event,
+			{
+				hasUI: true,
+				cwd: process.cwd(),
+				isIdle: () => true,
+				ui: {
+					custom: async () => "approve",
+					notify() {},
+				},
+			} as any,
+		);
+
+		expect(result).toBeUndefined();
+		expect(event.input).toEqual({
+			path: "notes.txt",
+			content: "first draft",
+		});
+	});
+
+	test("blocks in-scope writes when no reason is provided", async () => {
 		const toolCall = registerToolCallHandler();
 		const result = await toolCall(
 			{
@@ -309,7 +335,7 @@ describe("reviewChanges", () => {
 				isIdle: () => true,
 				ui: {
 					custom: async () => {
-						throw new Error("missing reasons should block before opening review UI");
+						throw new Error("review UI should not open when reason is missing");
 					},
 					notify() {},
 				},
@@ -317,6 +343,84 @@ describe("reviewChanges", () => {
 		);
 
 		expectBlockedWithReason(result);
+		expect((result as any).reason).toContain("set_change_reason");
+	});
+
+	test("uses set_change_reason for the next write proposal", async () => {
+		const toolCall = registerToolCallHandler();
+		const ctx = {
+			hasUI: true,
+			cwd: process.cwd(),
+			isIdle: () => true,
+			ui: {
+				custom: async () => "approve",
+				notify() {},
+			},
+		} as any;
+
+		const reasonResult = await toolCall(
+			{
+				toolName: "set_change_reason",
+				input: { reason: "Create notes" },
+			},
+			ctx,
+		);
+		expect(reasonResult).toBeUndefined();
+
+		const writeEvent = {
+			toolName: "write",
+			input: {
+				path: "@notes.txt",
+				content: "first draft",
+			},
+		};
+		const writeResult = await toolCall(writeEvent, ctx);
+
+		expect(writeResult).toBeUndefined();
+		expect(writeEvent.input).toEqual({
+			path: "notes.txt",
+			content: "first draft",
+		});
+	});
+
+	test("normalizes legacy edit payloads and strips non-native fields before execution", async () => {
+		const toolCall = registerToolCallHandler();
+		const directory = await mkdtemp(join(tmpdir(), "diffloop-edit-normalize-"));
+		const event = {
+			toolName: "edit",
+			input: {
+				path: "@src/file.ts",
+				oldText: "before",
+				newText: "after",
+				reason: "Update text",
+			},
+		};
+
+		try {
+			await mkdir(join(directory, "src"), { recursive: true });
+			await writeFile(join(directory, "src/file.ts"), "before");
+
+			const result = await toolCall(
+				event,
+				{
+					hasUI: true,
+					cwd: directory,
+					isIdle: () => true,
+					ui: {
+						custom: async () => "approve",
+						notify() {},
+					},
+				} as any,
+			);
+
+			expect(result).toBeUndefined();
+			expect(event.input).toEqual({
+				path: "src/file.ts",
+				edits: [{ oldText: "before", newText: "after" }],
+			});
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
 	});
 
 	test("skips review for out-of-scope files via include patterns", async () => {
@@ -353,6 +457,7 @@ describe("reviewChanges", () => {
 					input: {
 						path: "@src/file.ts",
 						content: "first draft",
+						reason: "Create first draft",
 					},
 				},
 				{
@@ -360,14 +465,12 @@ describe("reviewChanges", () => {
 					cwd: process.cwd(),
 					isIdle: () => true,
 					ui: {
-						custom: async () => {
-							throw new Error("in-scope missing reason should block before review UI");
-						},
+						custom: async () => "approve",
 						notify() {},
 					},
 				} as any,
 			);
-			expectBlockedWithReason(inScope);
+			expect(inScope).toBeUndefined();
 		} finally {
 			if (previousInclude === undefined) {
 				delete process.env.DIFFLOOP_REVIEW_INCLUDE;
