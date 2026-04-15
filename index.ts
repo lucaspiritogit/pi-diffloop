@@ -140,6 +140,25 @@ export default function reviewChanges(pi: ExtensionAPI) {
     return undefined;
   };
 
+  const syncReasonToolActivation = () => {
+    const api = pi as Partial<Pick<ExtensionAPI, "getActiveTools" | "setActiveTools">>;
+    if (typeof api.getActiveTools !== "function" || typeof api.setActiveTools !== "function") return;
+
+    const activeTools = api.getActiveTools();
+    const withoutReasonTool = activeTools.filter((toolName) => toolName !== DIFFLOOP_REASON_TOOL_NAME);
+
+    if (enabled) {
+      if (!activeTools.includes(DIFFLOOP_REASON_TOOL_NAME)) {
+        api.setActiveTools([...withoutReasonTool, DIFFLOOP_REASON_TOOL_NAME]);
+      }
+      return;
+    }
+
+    if (withoutReasonTool.length !== activeTools.length) {
+      api.setActiveTools(withoutReasonTool);
+    }
+  };
+
   pi.registerCommand("diffloop", {
     description: "Set diffloop on, off, toggle it, or show the current status",
     handler: async (args, ctx) => {
@@ -151,10 +170,18 @@ export default function reviewChanges(pi: ExtensionAPI) {
         return;
       }
 
+      const wasEnabled = enabled;
       if (action === "toggle") enabled = !enabled;
       if (action === "on") enabled = true;
       if (action === "off") enabled = false;
 
+      if (wasEnabled && !enabled) {
+        denyHold = false;
+        clearPendingChangeReasons();
+        await clearReadRequirements();
+      }
+
+      syncReasonToolActivation();
       displayDiffloopStatus(ctx, enabled, true, availableUpdateVersion);
     },
   });
@@ -191,6 +218,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
     await candidateFiles.clearSessionDirectory();
     candidateFiles.setSessionFromContext(ctx);
     await clearStaleCandidateDirectories();
+    syncReasonToolActivation();
     displayDiffloopStatus(ctx, enabled, false, availableUpdateVersion);
 
     void (async () => {
@@ -217,6 +245,13 @@ export default function reviewChanges(pi: ExtensionAPI) {
   });
 
   pi.on("tool_call", async (event, ctx) => {
+    if (!enabled && event.toolName === DIFFLOOP_REASON_TOOL_NAME) {
+      return {
+        block: true,
+        reason: `Blocked ${DIFFLOOP_REASON_TOOL_NAME}: diffloop is off. Enable it with /diffloop on before using this tool.`,
+      };
+    }
+
     if (
       !enabled ||
       (event.toolName !== "edit" &&

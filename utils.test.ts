@@ -1,8 +1,9 @@
+import { visibleWidth } from "@mariozechner/pi-tui";
 import { describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { normalizePath, pathExists, replaceObject } from "./utils";
+import { normalizePath, pathExists, pushLine, pushWrappedLine, replaceObject } from "./utils";
 
 describe("normalizePath", () => {
 	test("strips the leading @ shorthand", () => {
@@ -35,5 +36,27 @@ describe("replaceObject", () => {
 		replaceObject(target, { keep: "new", added: 42 });
 
 		expect(target).toEqual({ keep: "new", added: 42 });
+	});
+});
+
+describe("terminal rendering helpers", () => {
+	test("pushLine expands tabs before truncation", () => {
+		const lines: string[] = [];
+		pushLine(lines, 20, "	leading\tand\tmiddle");
+
+		expect(lines).toHaveLength(1);
+		expect(lines[0].includes("\t")).toBe(false);
+		expect(visibleWidth(lines[0])).toBeLessThanOrEqual(20);
+	});
+
+	test("pushWrappedLine keeps each wrapped line within width when tabs are present", () => {
+		const lines: string[] = [];
+		pushWrappedLine(lines, 24, "prefix\twith\ttabs and a long tail that wraps");
+
+		expect(lines.length).toBeGreaterThan(1);
+		for (const line of lines) {
+			expect(line.includes("\t")).toBe(false);
+			expect(visibleWidth(line)).toBeLessThanOrEqual(24);
+		}
 	});
 });

@@ -1,6 +1,12 @@
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
 import { access, constants } from "node:fs/promises";
 
+const TAB_REPLACEMENT = "    ";
+
+function normalizeForTerminalWidth(text: string): string {
+  return text.replace(/\t/g, TAB_REPLACEMENT);
+}
+
 export function normalizePath(path: string): string {
   return path.startsWith("@") ? path.slice(1) : path;
 }
@@ -15,11 +21,11 @@ export async function pathExists(path: string): Promise<boolean> {
 }
 
 export function pushLine(lines: string[], width: number, text: string) {
-  lines.push(truncateToWidth(text, width));
+  lines.push(truncateToWidth(normalizeForTerminalWidth(text), width));
 }
 
 export function pushWrappedLine(lines: string[], width: number, text: string) {
-  const wrapped = wrapTextWithAnsi(text, Math.max(1, width));
+  const wrapped = wrapTextWithAnsi(normalizeForTerminalWidth(text), Math.max(1, width));
   for (const line of wrapped) {
     lines.push(truncateToWidth(line, width, ""));
   }
@@ -39,23 +45,24 @@ export function pushWrappedMultiline(lines: string[], width: number, text: strin
 
 export function pushPreview(lines: string[], width: number, text: string, prefix: string) {
   for (const line of text.split("\n")) {
-    pushLine(lines, width, `${prefix}${line}`);
+    pushLine(lines, width, `${normalizeForTerminalWidth(prefix)}${normalizeForTerminalWidth(line)}`);
   }
 }
 
 export function pushWrappedPreview(lines: string[], width: number, text: string, prefix: string) {
-  const prefixWidth = visibleWidth(prefix);
+  const normalizedPrefix = normalizeForTerminalWidth(prefix);
+  const prefixWidth = visibleWidth(normalizedPrefix);
   const contentWidth = Math.max(1, width - prefixWidth);
 
   for (const line of text.split("\n")) {
-    const wrapped = wrapTextWithAnsi(line, contentWidth);
+    const wrapped = wrapTextWithAnsi(normalizeForTerminalWidth(line), contentWidth);
     if (wrapped.length === 0) {
-      lines.push(truncateToWidth(prefix, width, ""));
+      lines.push(truncateToWidth(normalizedPrefix, width, ""));
       continue;
     }
 
     for (const wrappedLine of wrapped) {
-      lines.push(truncateToWidth(`${prefix}${wrappedLine}`, width, ""));
+      lines.push(truncateToWidth(`${normalizedPrefix}${wrappedLine}`, width, ""));
     }
   }
 }
