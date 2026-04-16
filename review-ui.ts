@@ -355,6 +355,26 @@ function renderLegacyPreviewLine(
           : theme.fg("dim", line.text);
 }
 
+function countReviewDiffStats(review: ReviewData): { additions: number; removals: number } {
+  let additions = 0;
+  let removals = 0;
+
+  for (const change of review.changes) {
+    if (change.diffModel) {
+      additions += change.diffModel.additions;
+      removals += change.diffModel.deletions;
+      continue;
+    }
+
+    for (const line of change.lines) {
+      if (line.kind === "add") additions++;
+      if (line.kind === "remove") removals++;
+    }
+  }
+
+  return { additions, removals };
+}
+
 export async function handleReviewAction(ctx: ExtensionContext, review: ReviewData): Promise<ReviewDecision> {
   return ctx.ui.custom<ReviewDecision>(
     (tui, theme, _keybindings, done) => {
@@ -424,10 +444,16 @@ export async function handleReviewAction(ctx: ExtensionContext, review: ReviewDa
         const headerLines: string[] = [];
         const innerWidth = Math.max(20, width - 2);
         const divider = theme.fg("borderAccent", "─".repeat(innerWidth));
+        const diffStats = countReviewDiffStats(review);
 
         pushLine(headerLines, width, divider);
         pushWrappedLine(headerLines, width, theme.fg("dim", theme.bold(`Review ${review.toolName}: ${review.path}`)));
         pushWrappedLine(headerLines, width, theme.fg("accent", `Why: ${review.reason}`));
+        pushWrappedLine(
+          headerLines,
+          width,
+          `${theme.fg("dim", "Diff:")} ${theme.fg("success", `+${diffStats.additions}`)} ${theme.fg("dim", "/")} ${theme.fg("error", `-${diffStats.removals}`)}`,
+        );
         headerLines.push("");
 
         return { headerLines, divider };

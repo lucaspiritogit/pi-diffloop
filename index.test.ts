@@ -1,11 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { access, mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import reviewChanges, {
 	buildReviewBodyLines,
 	buildSteeringInstruction,
-	clearCandidateFilesDirectory,
 	normalizeEditInput,
 	normalizeReviewModeAction,
 	normalizeEditArguments,
@@ -13,7 +12,6 @@ import reviewChanges, {
 import { resolveDiffloopConfigPath } from "./review-scope";
 import { buildStructuredDiff } from "./structured-diff";
 
-const CANDIDATE_FILES_DIR = join(tmpdir(), "diffloop", "candidate-files");
 const DIFFLOOP_CONFIG_PATH = resolveDiffloopConfigPath(__dirname);
 
 function createReviewHarness() {
@@ -21,6 +19,7 @@ function createReviewHarness() {
 	let diffloopCommandHandler: ((args: string, ctx: any) => Promise<void>) | undefined;
 	const sentMessages: Array<{ message: string; options?: unknown }> = [];
 	const sentHiddenMessages: Array<{ message: unknown; options?: unknown }> = [];
+	const appendedEntries: Array<{ customType: string; data?: unknown }> = [];
 
 	reviewChanges({
 		registerCommand(name: string, config: any) {
@@ -35,6 +34,9 @@ function createReviewHarness() {
 		sendMessage(message: unknown, options?: unknown) {
 			sentHiddenMessages.push({ message, options });
 		},
+		appendEntry(customType: string, data?: unknown) {
+			appendedEntries.push({ customType, data });
+		},
 		on(event: string, handler: Function) {
 			handlers.set(event, handler);
 		},
@@ -47,7 +49,7 @@ function createReviewHarness() {
 	const input = handlers.get("input");
 	if (!input) throw new Error("input handler was not registered");
 	if (!diffloopCommandHandler) throw new Error("diffloop command handler was not registered");
-	return { toolCall, toolResult, input, diffloopCommandHandler, sentMessages, sentHiddenMessages };
+	return { toolCall, toolResult, input, diffloopCommandHandler, sentMessages, sentHiddenMessages, appendedEntries };
 }
 
 function registerToolCallHandler() {
@@ -56,30 +58,6 @@ function registerToolCallHandler() {
 
 function expectBlockedWithReason(result: unknown) {
 	expect(result).toEqual(expect.objectContaining({ block: true }));
-}
-
-function extractEditedProposalPath(reason: string): string | undefined {
-	const match = reason.match(/\S*candidate-files\/[^/\s]+\/[^\s]+/);
-	if (!match) return undefined;
-	return match[0].replace(/[.,]$/, "");
-}
-
-async function fileExists(path: string): Promise<boolean> {
-	try {
-		await access(path);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-async function directoryHasEntries(path: string): Promise<boolean> {
-	try {
-		const entries = await readdir(path);
-		return entries.length > 0;
-	} catch {
-		return false;
-	}
 }
 
 async function readDiffloopConfigSnapshot(): Promise<string | undefined> {
@@ -369,18 +347,6 @@ describe("buildReviewBodyLines", () => {
 	});
 });
 
-describe("clearCandidateFilesDirectory", () => {
-	test("removes the candidate directory recursively", async () => {
-		const directory = await mkdtemp(join(tmpdir(), "diffloop-candidate-cleanup-"));
-		await mkdir(join(directory, "nested"), { recursive: true });
-		await writeFile(join(directory, "nested/candidate.ts"), "export const value = 1;\n");
-
-		expect(await fileExists(directory)).toBe(true);
-		await clearCandidateFilesDirectory(directory);
-		expect(await fileExists(directory)).toBe(false);
-	});
-});
-
 describe("reviewChanges", () => {
 	test("registers the command and lifecycle handlers", () => {
 		const commands: Array<{ name: string; config: unknown }> = [];
@@ -515,6 +481,67 @@ describe("reviewChanges", () => {
 			expect((enabledResult as any).reason).toContain("set_change_reason");
 		} finally {
 			await restoreDiffloopConfig(configSnapshot);
+		}
+	});
+
+	test("appends diffloop audit entries for blocked previews and approved decisions", async () => {
+		const { toolCall, appendedEntries } = createReviewHarness();
+		const directory = await mkdtemp(join(tmpdir(), "diffloop-audit-entries-"));
+
+		try {
+			await mkdir(join(directory, "src"), { recursive: true });
+
+			const blocked = await toolCall(
+				{
+					toolName: "edit",
+					input: {
+						path: "@src/new-file.ts",
+						reason: "Create initial content",
+						edits: [{ oldText: "placeholder", newText: "export const value = 1;\n" }],
+					},
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					isIdle: () => true,
+					ui: {
+						custom: async () => {
+							throw new Error("missing target should block before opening review UI");
+						},
+						notify() {},
+					},
+				} as any,
+			);
+			expectBlockedWithReason(blocked);
+
+			const approved = await toolCall(
+				{
+					toolName: "write",
+					input: {
+						path: "@src/new-file.ts",
+						reason: "Write initial content",
+						content: "export const value = 1;\n",
+					},
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					isIdle: () => true,
+					ui: {
+						custom: async () => "approve",
+						notify() {},
+					},
+				} as any,
+			);
+			expect(approved).toBeUndefined();
+
+			const audits = appendedEntries
+				.filter((entry) => entry.customType === "diffloop-audit")
+				.map((entry) => entry.data as { kind?: string; action?: string });
+			expect(audits.some((entry) => entry.kind === "blocked")).toBe(true);
+			expect(audits.some((entry) => entry.kind === "decision" && entry.action === "approve")).toBe(true);
+		} finally {
+			await rm(directory, { recursive: true, force: true });
 		}
 	});
 
@@ -716,41 +743,6 @@ describe("reviewChanges", () => {
 			expect(inScope).toBeUndefined();
 		} finally {
 			await restoreDiffloopConfig(configSnapshot);
-		}
-	});
-
-	test("creates a candidate file when reviewing write proposals", async () => {
-		const { toolCall } = createReviewHarness();
-		const directory = await mkdtemp(join(tmpdir(), "diffloop-write-candidate-"));
-
-		try {
-			await clearCandidateFilesDirectory(CANDIDATE_FILES_DIR);
-
-			const result = await toolCall(
-				{
-					toolName: "write",
-					input: {
-						path: "@notes.txt",
-						reason: "Create notes file",
-						content: "first draft",
-					},
-				},
-				{
-					hasUI: true,
-					cwd: directory,
-					isIdle: () => true,
-					ui: {
-						custom: async () => "approve",
-						notify() {},
-					},
-				} as any,
-			);
-
-			expect(result).toBeUndefined();
-			expect(await directoryHasEntries(CANDIDATE_FILES_DIR)).toBe(true);
-		} finally {
-			await clearCandidateFilesDirectory(CANDIDATE_FILES_DIR);
-			await rm(directory, { recursive: true, force: true });
 		}
 	});
 
@@ -983,11 +975,28 @@ describe("reviewChanges", () => {
 					},
 				} as any,
 			);
-			expectBlockedWithReason(blocked);
-			expect((blocked as any).reason).toContain("read src/file.ts first");
+				expectBlockedWithReason(blocked);
+				expect((blocked as any).reason).toContain("read src/file.ts first");
 
-			const readAttempt = await toolCall(
-				{
+				const unrelatedPathAllowed = await toolCall(
+					{
+						toolName: "write",
+						input: { path: "@src/other.ts", reason: "unrelated", content: "export const other = 1;\n" },
+					},
+					{
+						hasUI: true,
+						cwd: directory,
+						isIdle: () => true,
+						ui: {
+							custom: async () => "approve",
+							notify() {},
+						},
+					} as any,
+				);
+				expect(unrelatedPathAllowed).toBeUndefined();
+
+				const readAttempt = await toolCall(
+					{
 					toolName: "read",
 					toolCallId: "read-after-error",
 					input: { path: "@src/file.ts" },
@@ -1072,8 +1081,8 @@ describe("reviewChanges", () => {
 		}
 	});
 
-	test("blocks missing-target edits before opening review and routes replanning through candidate files", async () => {
-		const { toolCall, toolResult } = createReviewHarness();
+	test("blocks missing-target edits before opening review and asks for a write proposal", async () => {
+		const { toolCall } = createReviewHarness();
 		const directory = await mkdtemp(join(tmpdir(), "diffloop-missing-target-"));
 
 		try {
@@ -1102,61 +1111,11 @@ describe("reviewChanges", () => {
 			);
 
 			expectBlockedWithReason(first);
-			expect((first as any).reason).toContain("candidate-files/");
-			const candidatePath = extractEditedProposalPath((first as any).reason as string);
-			expect(candidatePath?.endsWith(".ts")).toBe(true);
-			if (!candidatePath) {
-				throw new Error("Expected a candidate path for missing-target replanning");
-			}
-			expect(await fileExists(candidatePath)).toBe(true);
+			expect((first as any).reason).toContain("Target file is missing");
+			expect((first as any).reason).toContain("Submit one write proposal");
+			expect((first as any).reason).not.toContain("candidate-files/");
 
-			const blockedBeforeReads = await toolCall(
-				{
-					toolName: "write",
-					input: { path: "@src/new-file.ts", reason: "Try write", content: "export const value = 2;" },
-				},
-				{
-					hasUI: true,
-					cwd: directory,
-					ui: { notify() {} },
-				} as any,
-			);
-
-			expectBlockedWithReason(blockedBeforeReads);
-
-			const readCandidate = await toolCall(
-				{
-					toolName: "read",
-					toolCallId: "read-missing-candidate",
-					input: { path: candidatePath },
-				},
-				{
-					hasUI: true,
-					cwd: directory,
-					ui: { notify() {} },
-				} as any,
-			);
-			expect(readCandidate).toBeUndefined();
-
-			const readCandidateResult = await toolResult(
-				{
-					toolName: "read",
-					toolCallId: "read-missing-candidate",
-					input: { path: candidatePath },
-					content: "export const value = 1;",
-					details: {},
-					isError: false,
-				},
-				{
-					hasUI: true,
-					cwd: directory,
-					ui: { notify() {} },
-				} as any,
-			);
-			expect(readCandidateResult).toBeUndefined();
-			expect(await fileExists(candidatePath)).toBe(false);
-
-			const allowedAfterReads = await toolCall(
+			const allowedWrite = await toolCall(
 				{
 					toolName: "write",
 					input: { path: "@src/new-file.ts", reason: "Now write", content: "export const value = 2;" },
@@ -1171,8 +1130,64 @@ describe("reviewChanges", () => {
 					},
 				} as any,
 			);
+			expect(allowedWrite).toBeUndefined();
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
 
-			expect(allowedAfterReads).toBeUndefined();
+	test("repeats blocked guidance for repeated missing-target edit proposals", async () => {
+		const { toolCall } = createReviewHarness();
+		const directory = await mkdtemp(join(tmpdir(), "diffloop-missing-target-repeat-"));
+
+		try {
+			await mkdir(join(directory, "src"), { recursive: true });
+
+			const input = {
+				path: "@src/new-file.ts",
+				reason: "Create the initial implementation",
+				edits: [{ oldText: "placeholder", newText: "export const value = 1;\n" }],
+			};
+
+			const first = await toolCall(
+				{
+					toolName: "edit",
+					input,
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					isIdle: () => true,
+					ui: {
+						custom: async () => {
+							throw new Error("missing-target previews should block before opening review UI");
+						},
+						notify() {},
+					},
+				} as any,
+			);
+			expectBlockedWithReason(first);
+			expect((first as any).reason).toContain("Target file is missing");
+
+			const second = await toolCall(
+				{
+					toolName: "edit",
+					input,
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					isIdle: () => true,
+					ui: {
+						custom: async () => {
+							throw new Error("missing-target previews should block before opening review UI");
+						},
+						notify() {},
+					},
+				} as any,
+			);
+			expectBlockedWithReason(second);
+			expect((second as any).reason).toContain("Target file is missing");
 		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}
@@ -1213,9 +1228,9 @@ describe("reviewChanges", () => {
 		}
 	});
 
-	test("blocks edited write proposals and requests read-first reassessment", async () => {
+	test("re-reviews edited write proposals before final approval", async () => {
 		const { toolCall, sentHiddenMessages } = createReviewHarness();
-		const customResults = ["edit"];
+		const customResults = ["edit", "approve"];
 		const directory = await mkdtemp(join(tmpdir(), "diffloop-edited-write-missing-target-"));
 
 		try {
@@ -1233,124 +1248,58 @@ describe("reviewChanges", () => {
 				cwd: directory,
 				isIdle: () => true,
 				ui: {
-					custom: async () => customResults.shift() ?? "edit",
+					custom: async () => customResults.shift() ?? "approve",
 					editor: async () => "second draft",
 					notify() {},
 				},
 			} as any);
 
-			expectBlockedWithReason(result);
-			expect((result as any).reason).not.toContain("Read notes.txt and");
-			expect((result as any).reason).toContain("candidate-files/");
-			const candidatePath = extractEditedProposalPath((result as any).reason as string);
-			expect(candidatePath?.endsWith(".json")).toBe(false);
-			expect(candidatePath?.endsWith(".txt")).toBe(true);
+			expect(result).toBeUndefined();
+			expect(event.input).toEqual({
+				path: "notes.txt",
+				content: "second draft",
+			});
 			expect(sentHiddenMessages).toEqual([]);
 		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}
 	});
 
-	test("requires reading both target and candidate after developer edits when target already exists", async () => {
+	test("applies approved edited write content on tool_result even if original write payload ran", async () => {
 		const { toolCall, toolResult } = createReviewHarness();
 		const customResults = ["edit", "approve"];
-		const directory = await mkdtemp(join(tmpdir(), "diffloop-edited-write-existing-target-"));
+		const directory = await mkdtemp(join(tmpdir(), "diffloop-write-override-"));
 
 		try {
-			await writeFile(join(directory, "notes.txt"), "existing\n");
+			const event = {
+				toolName: "write",
+				toolCallId: "write-override-1",
+				input: {
+					path: "@notes.txt",
+					reason: "Create notes",
+					content: "first draft",
+				},
+			};
 
-			const first = await toolCall(
+			const callResult = await toolCall(event, {
+				hasUI: true,
+				cwd: directory,
+				isIdle: () => true,
+				ui: {
+					custom: async () => customResults.shift() ?? "approve",
+					editor: async () => "second draft",
+					notify() {},
+				},
+			} as any);
+			expect(callResult).toBeUndefined();
+
+			await writeFile(join(directory, "notes.txt"), "first draft", "utf8");
+			const result = await toolResult(
 				{
 					toolName: "write",
-					input: {
-						path: "@notes.txt",
-						reason: "Create notes",
-						content: "first draft",
-					},
-				},
-				{
-					hasUI: true,
-					cwd: directory,
-					isIdle: () => true,
-					ui: {
-						custom: async () => customResults.shift() ?? "edit",
-						editor: async () => "second draft",
-						notify() {},
-					},
-				} as any,
-			);
-			expectBlockedWithReason(first);
-			const firstReason = (first as any).reason as string;
-			expect(firstReason).toContain("Read notes.txt and");
-			const editedProposalPath = extractEditedProposalPath(firstReason);
-			expect(editedProposalPath).toBeDefined();
-			if (!editedProposalPath) {
-				throw new Error("Expected an edited proposal path in steering instruction");
-			}
-
-			const blocked = await toolCall(
-				{
-					toolName: "write",
-					input: { path: "@notes.txt", reason: "Try write", content: "next" },
-				},
-				{
-					hasUI: true,
-					cwd: directory,
-					ui: { notify() {} },
-				} as any,
-			);
-
-			expectBlockedWithReason(blocked);
-
-			const readResult = await toolCall(
-				{
-					toolName: "read",
-					toolCallId: "read-target",
+					toolCallId: "write-override-1",
 					input: { path: "@notes.txt" },
-				},
-				{
-					hasUI: true,
-					cwd: directory,
-					ui: { notify() {} },
-				} as any,
-			);
-			expect(readResult).toBeUndefined();
-
-			const stillBlockedAfterTargetRead = await toolCall(
-				{
-					toolName: "write",
-					input: { path: "@notes.txt", reason: "Try write", content: "next" },
-				},
-				{
-					hasUI: true,
-					cwd: directory,
-					ui: { notify() {} },
-				} as any,
-			);
-
-			expectBlockedWithReason(stillBlockedAfterTargetRead);
-
-			const readEditedProposal = await toolCall(
-				{
-					toolName: "read",
-					toolCallId: "read-edited-proposal",
-					input: { path: editedProposalPath },
-				},
-				{
-					hasUI: true,
-					cwd: directory,
-					ui: { notify() {} },
-				} as any,
-			);
-			expect(readEditedProposal).toBeUndefined();
-			expect(await fileExists(editedProposalPath)).toBe(true);
-
-			const readEditedProposalResult = await toolResult(
-				{
-					toolName: "read",
-					toolCallId: "read-edited-proposal",
-					input: { path: editedProposalPath },
-					content: "{}",
+					content: [{ type: "text", text: "write ok" }],
 					details: {},
 					isError: false,
 				},
@@ -1360,34 +1309,65 @@ describe("reviewChanges", () => {
 					ui: { notify() {} },
 				} as any,
 			);
-			expect(readEditedProposalResult).toBeUndefined();
-			expect(await fileExists(editedProposalPath)).toBe(false);
-
-			const allowedAfterRead = await toolCall(
-				{
-					toolName: "write",
-					input: { path: "@notes.txt", reason: "Try write", content: "next" },
-				},
-				{
-					hasUI: true,
-					cwd: directory,
-					isIdle: () => true,
-					ui: {
-						custom: async () => customResults.shift() ?? "approve",
-						notify() {},
-					},
-				} as any,
-			);
-
-			expect(allowedAfterRead).toBeUndefined();
+			expect(result).toBeUndefined();
+			expect(await readFile(join(directory, "notes.txt"), "utf8")).toBe("second draft");
 		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}
 	});
 
-	test("blocks edited edit proposals and requests read-first reassessment", async () => {
+	test("applies approved edited write content on tool_result when toolCallId is missing", async () => {
+		const { toolCall, toolResult } = createReviewHarness();
+		const customResults = ["edit", "approve"];
+		const directory = await mkdtemp(join(tmpdir(), "diffloop-write-override-no-id-"));
+
+		try {
+			const event = {
+				toolName: "write",
+				input: {
+					path: "@notes.txt",
+					reason: "Create notes",
+					content: "first draft",
+				},
+			};
+
+			const callResult = await toolCall(event, {
+				hasUI: true,
+				cwd: directory,
+				isIdle: () => true,
+				ui: {
+					custom: async () => customResults.shift() ?? "approve",
+					editor: async () => "second draft",
+					notify() {},
+				},
+			} as any);
+			expect(callResult).toBeUndefined();
+
+			await writeFile(join(directory, "notes.txt"), "first draft", "utf8");
+			const result = await toolResult(
+				{
+					toolName: "write",
+					input: { path: "@notes.txt" },
+					content: [{ type: "text", text: "write ok" }],
+					details: {},
+					isError: false,
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					ui: { notify() {} },
+				} as any,
+			);
+			expect(result).toBeUndefined();
+			expect(await readFile(join(directory, "notes.txt"), "utf8")).toBe("second draft");
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("re-reviews edited edit proposals before final approval", async () => {
 		const { toolCall, sentHiddenMessages } = createReviewHarness();
-		const customResults = ["edit"];
+		const customResults = ["edit", "approve"];
 		const directory = await mkdtemp(join(tmpdir(), "diffloop-edit-proposal-"));
 
 		try {
@@ -1408,18 +1388,17 @@ describe("reviewChanges", () => {
 				cwd: directory,
 				isIdle: () => true,
 				ui: {
-					custom: async () => customResults.shift() ?? "edit",
+					custom: async () => customResults.shift() ?? "approve",
 					editor: async () => "if (newer)",
 					notify() {},
 				},
 			} as any);
 
-			expectBlockedWithReason(result);
-			expect((result as any).reason).toContain("Read src/file.ts");
-			expect((result as any).reason).toContain("candidate-files/");
-			const candidatePath = extractEditedProposalPath((result as any).reason as string);
-			expect(candidatePath?.endsWith(".json")).toBe(false);
-			expect(candidatePath?.endsWith(".ts")).toBe(true);
+			expect(result).toBeUndefined();
+			expect(event.input).toEqual({
+				path: "src/file.ts",
+				edits: [{ oldText: "if (old)", newText: "if (newer)" }],
+			});
 			expect(sentHiddenMessages).toEqual([]);
 		} finally {
 			await rm(directory, { recursive: true, force: true });

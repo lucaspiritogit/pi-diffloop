@@ -1,19 +1,13 @@
 import {
+  isWriteToolResult,
   type ExtensionAPI,
   type ExtensionContext,
 } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { spawnSync } from "node:child_process";
-import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { extname, join, resolve } from "node:path";
-import {
-  buildEditedProposalCandidate,
-  clearStaleCandidateDirectories,
-  createCandidateFilesSessionManager,
-  persistEditedProposal,
-  registerCandidateFilesProcessCleanup,
-} from "./candidate-files";
+import { dirname, extname, join, resolve } from "node:path";
 import {
   applyEditBlocksToContent,
   buildEditValidationErrors,
@@ -24,21 +18,15 @@ import {
   runNativeEditPreview,
   runNativeWritePreview,
 } from "./diff-preview";
-import { handleReviewAction } from "./review-ui";
-import { isPathInReviewScope, loadDiffloopConfig, saveEnabledToConfig } from "./review-scope";
+import { loadDiffloopConfig, saveEnabledToConfig } from "./review-scope";
 import type { EditBlock, EditInput, NativeEditBlockStatus, ReviewData, WriteInput } from "./review-types";
+import { appendDiffloopAudit, readDiffloopAuditStats } from "./diffloop-audit";
+import { handleReviewToolCall } from "./review-pipeline";
+import { createDiffloopRuntimeState } from "./runtime-state";
 import { buildStructuredDiff } from "./structured-diff";
-import {
-  buildBlockedEditApprovalInstruction,
-  buildEditedProposalInstruction,
-  buildMissingTargetEditInstruction,
-  buildSteeringInstruction,
-  joinPathList,
-} from "./tool-hooks";
-import { normalizePath, pathExists } from "./utils";
+import { normalizePath } from "./utils";
 import { getCachedDiffloopUpdateVersion } from "./version-status";
 
-export { clearCandidateFilesDirectory } from "./candidate-files";
 export { buildReviewBodyLines } from "./review-ui";
 export { buildSteeringInstruction } from "./tool-hooks";
 
@@ -88,64 +76,9 @@ function normalizeReasonValue(reason: unknown): string {
 }
 
 export default function reviewChanges(pi: ExtensionAPI) {
-  registerCandidateFilesProcessCleanup();
-  void clearStaleCandidateDirectories();
-
-  let { enabled, reviewScope } = loadDiffloopConfig();
-  const pendingReadPaths = new Set<string>();
-  let pendingEditedProposalPath: string | undefined;
-  let pendingEditedProposalReadToolCallId: string | undefined;
-  let denyHold = false;
-  const candidateFiles = createCandidateFilesSessionManager();
+  const state = createDiffloopRuntimeState(loadDiffloopConfig());
   let availableUpdateVersion: string | undefined;
-
-  const refreshDiffloopConfig = () => {
-    const nextConfig = loadDiffloopConfig();
-    enabled = nextConfig.enabled;
-    reviewScope = nextConfig.reviewScope;
-  };
-
-  const clearPendingEditedProposal = async () => {
-    pendingEditedProposalPath = undefined;
-    pendingEditedProposalReadToolCallId = undefined;
-    await candidateFiles.clearSessionDirectory();
-  };
-
-  const clearReadRequirements = async () => {
-    pendingReadPaths.clear();
-    await clearPendingEditedProposal();
-  };
-
-  const setPendingReadRequirements = (...paths: Array<string | undefined>) => {
-    pendingReadPaths.clear();
-    for (const path of paths) {
-      if (!path) continue;
-      pendingReadPaths.add(path);
-    }
-  };
-
-  const pendingChangeReasons: string[] = [];
-
-  const clearPendingChangeReasons = () => {
-    pendingChangeReasons.length = 0;
-  };
-
-  const queuePendingChangeReason = (reason: unknown): boolean => {
-    const normalizedReason = normalizeReasonValue(reason);
-    if (!normalizedReason) return false;
-
-    pendingChangeReasons.push(normalizedReason);
-    return true;
-  };
-
-  const consumePendingChangeReason = (): string | undefined => {
-    while (pendingChangeReasons.length > 0) {
-      const reason = normalizeReasonValue(pendingChangeReasons.shift());
-      if (reason) return reason;
-    }
-
-    return undefined;
-  };
+  let auditStatsSuffix = "";
 
   const sendSteeringFeedback = (message: string): boolean => {
     try {
@@ -156,6 +89,41 @@ export default function reviewChanges(pi: ExtensionAPI) {
     }
   };
 
+  const refreshAuditStatus = (ctx: ExtensionContext) => {
+    if (!ctx.hasUI) {
+      auditStatsSuffix = "";
+      return;
+    }
+    if (typeof (ctx as any).sessionManager?.getBranch !== "function") {
+      auditStatsSuffix = "";
+      return;
+    }
+    const stats = readDiffloopAuditStats(ctx);
+    if (stats.decisions === 0 && stats.blocked === 0 && stats.recoveries === 0) {
+      auditStatsSuffix = "";
+      return;
+    }
+    auditStatsSuffix = ` ${ctx.ui.theme.fg("dim", `d${stats.decisions} b${stats.blocked} r${stats.recoveries}`)}`;
+  };
+
+  const blockWithReason = (
+    reason: string,
+    _key?: string,
+    meta?: { code: string; toolName?: "write" | "edit"; path?: string },
+  ) => {
+    const blocked = state.buildBlockedResult(reason);
+    if (blocked.reason) {
+      appendDiffloopAudit(pi, {
+        kind: "blocked",
+        code: meta?.code ?? "blocked",
+        toolName: meta?.toolName,
+        path: meta?.path,
+        reason: blocked.reason,
+      });
+    }
+    return blocked;
+  };
+
   const syncReasonToolActivation = () => {
     const api = pi as Partial<Pick<ExtensionAPI, "getActiveTools" | "setActiveTools">>;
     if (typeof api.getActiveTools !== "function" || typeof api.setActiveTools !== "function") return;
@@ -163,7 +131,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
     const activeTools = api.getActiveTools();
     const withoutReasonTool = activeTools.filter((toolName) => toolName !== DIFFLOOP_REASON_TOOL_NAME);
 
-    if (enabled) {
+    if (state.getEnabled()) {
       if (!activeTools.includes(DIFFLOOP_REASON_TOOL_NAME)) {
         api.setActiveTools([...withoutReasonTool, DIFFLOOP_REASON_TOOL_NAME]);
       }
@@ -179,35 +147,40 @@ export default function reviewChanges(pi: ExtensionAPI) {
     description: "Set diffloop on, off, toggle it, or show the current status",
     handler: async (args, ctx) => {
       const action = normalizeReviewModeAction(args);
+      const enabled = state.getEnabled();
 
       if (action === "invalid") {
         ctx.ui.notify("Usage: /diffloop [on|off|toggle|status]", "error");
-        displayDiffloopStatus(ctx, enabled, false, availableUpdateVersion);
+        displayDiffloopStatus(ctx, enabled, false, availableUpdateVersion, auditStatsSuffix);
         return;
       }
 
       const wasEnabled = enabled;
-      if (action === "toggle") enabled = !enabled;
-      if (action === "on") enabled = true;
-      if (action === "off") enabled = false;
+      let nextEnabled = enabled;
+      if (action === "toggle") nextEnabled = !enabled;
+      if (action === "on") nextEnabled = true;
+      if (action === "off") nextEnabled = false;
+      state.setEnabled(nextEnabled);
 
       if (action !== "status") {
         try {
-          saveEnabledToConfig(enabled);
+          saveEnabledToConfig(nextEnabled);
+          appendDiffloopAudit(pi, { kind: "toggle", enabled: nextEnabled });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           ctx.ui.notify(`Failed to persist diffloop state: ${message}`, "warning");
         }
       }
 
-      if (wasEnabled && !enabled) {
-        denyHold = false;
-        clearPendingChangeReasons();
-        await clearReadRequirements();
+      if (wasEnabled && !nextEnabled) {
+        state.setDenyHold(false);
+        state.clearPendingChangeReasons();
+        state.clearReadRequirements();
       }
 
       syncReasonToolActivation();
-      displayDiffloopStatus(ctx, enabled, true, availableUpdateVersion);
+      refreshAuditStatus(ctx);
+      displayDiffloopStatus(ctx, nextEnabled, true, availableUpdateVersion, auditStatsSuffix);
     },
   });
 
@@ -231,7 +204,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event) => {
-    if (!enabled) return undefined;
+    if (!state.getEnabled()) return undefined;
 
     return {
       systemPrompt: `${event.systemPrompt}\n\n${DIFFLOOP_REASON_GUIDANCE}`,
@@ -239,254 +212,94 @@ export default function reviewChanges(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
-    refreshDiffloopConfig();
-    clearPendingChangeReasons();
-    await candidateFiles.clearSessionDirectory();
-    candidateFiles.setSessionFromContext(ctx);
-    await clearStaleCandidateDirectories();
+    state.refreshConfig(loadDiffloopConfig());
+    state.resetForSessionBoundary();
     syncReasonToolActivation();
-    displayDiffloopStatus(ctx, enabled, false, availableUpdateVersion);
+    refreshAuditStatus(ctx);
+    displayDiffloopStatus(ctx, state.getEnabled(), false, availableUpdateVersion, auditStatsSuffix);
 
     void (async () => {
       availableUpdateVersion = await getCachedDiffloopUpdateVersion();
       if (availableUpdateVersion) {
-        displayDiffloopStatus(ctx, enabled, false, availableUpdateVersion);
+        displayDiffloopStatus(ctx, state.getEnabled(), false, availableUpdateVersion, auditStatsSuffix);
       }
     })();
   });
 
+  pi.on("session_tree", async (_event, ctx) => {
+    state.resetForSessionBoundary();
+    refreshAuditStatus(ctx);
+    displayDiffloopStatus(ctx, state.getEnabled(), false, availableUpdateVersion, auditStatsSuffix);
+  });
+
+  pi.on("session_shutdown", async () => {
+    state.resetForSessionBoundary();
+  });
+
   pi.on("input", async (event, ctx) => {
     if (event.source !== "extension") {
-      clearPendingChangeReasons();
+      state.clearPendingChangeReasons();
     }
 
-    if (!denyHold) return;
+    if (!state.getDenyHold()) return;
     if (event.source === "extension") return;
 
-    denyHold = false;
-    await clearReadRequirements();
+    state.setDenyHold(false);
+    state.clearReadRequirements();
     if (ctx.hasUI) {
       ctx.ui.notify("Deny lock cleared. Reviewing can continue on the new prompt.", "info");
     }
   });
 
   pi.on("tool_call", async (event, ctx) => {
-    if (!enabled && event.toolName === DIFFLOOP_REASON_TOOL_NAME) {
-      return {
-        block: true,
-        reason: `Blocked ${DIFFLOOP_REASON_TOOL_NAME}: diffloop is off. Enable it with /diffloop on before using this tool.`,
-      };
-    }
-
-    if (
-      !enabled ||
-      (event.toolName !== "edit" &&
-        event.toolName !== "write" &&
-        event.toolName !== "read" &&
-        event.toolName !== DIFFLOOP_REASON_TOOL_NAME)
-    ) {
-      return undefined;
-    }
-
-    if (event.toolName === DIFFLOOP_REASON_TOOL_NAME) {
-      const reason = normalizeReasonValue((event.input as { reason?: unknown } | undefined)?.reason);
-      if (!reason) {
-        return {
-          block: true,
-          reason: `Blocked ${DIFFLOOP_REASON_TOOL_NAME}: include a non-empty reason and retry.`,
-        };
-      }
-
-      queuePendingChangeReason(reason);
-      event.input = { reason };
-      return undefined;
-    }
-
-    if (event.toolName === "read") {
-      if (pendingReadPaths.size === 0) return undefined;
-
-      const normalizedReadPath = typeof event.input.path === "string" ? normalizePath(event.input.path) : "";
-      if (!normalizedReadPath) return undefined;
-
-      const absoluteReadPath = resolve(ctx.cwd, normalizedReadPath);
-      const matchedRequiredPaths = Array.from(pendingReadPaths).filter(
-        (requiredPath) => resolve(ctx.cwd, requiredPath) === absoluteReadPath,
-      );
-      if (matchedRequiredPaths.length === 0) return undefined;
-
-      for (const requiredPath of matchedRequiredPaths) {
-        pendingReadPaths.delete(requiredPath);
-        if (pendingEditedProposalPath && requiredPath === pendingEditedProposalPath) {
-          pendingEditedProposalReadToolCallId = typeof event.toolCallId === "string" ? event.toolCallId : undefined;
-        }
-      }
-
-      return undefined;
-    }
-
-    if (event.toolName !== "edit" && event.toolName !== "write") {
-      return undefined;
-    }
-    const toolName = event.toolName;
-    let resolvedChangeReason: string | undefined;
-
-    if (!ctx.hasUI) {
-      return { block: true, reason: `Blocked ${toolName}: no interactive UI available for approval` };
-    }
-
-    while (true) {
-      if (denyHold) {
-        return {
-          block: true,
-          reason: "Developer denied the previous change. Wait for a new user prompt.",
-        };
-      }
-
-      const proposedInput = normalizeToolCallInput(toolName, event.input);
-      sanitizeToolCallInput(event, toolName, proposedInput);
-      if (!proposedInput.path) {
-        return {
-          block: true,
-          reason: `Blocked ${toolName}: include a valid path and retry.`,
-        };
-      }
-      if (toolName === "edit" && (proposedInput as EditInput).edits.length === 0) {
-        return {
-          block: true,
-          reason: "Blocked edit: include at least one valid oldText/newText edit block and retry.",
-        };
-      }
-
-      const normalizedInputPath = proposedInput.path;
-      refreshDiffloopConfig();
-      if (!isPathInReviewScope(normalizedInputPath, reviewScope)) {
-        consumePendingChangeReason();
-        return undefined;
-      }
-
-      if (pendingReadPaths.size > 0) {
-        return {
-          block: true,
-          reason: `Blocked ${toolName}: read ${joinPathList(Array.from(pendingReadPaths))} first.`,
-        };
-      }
-
-      if (!resolvedChangeReason) {
-        resolvedChangeReason = normalizeReasonValue(proposedInput.reason) || consumePendingChangeReason();
-      }
-      proposedInput.reason = resolvedChangeReason ?? "";
-      if (!proposedInput.reason) {
-        return {
-          block: true,
-          reason: `Blocked ${toolName}: call ${DIFFLOOP_REASON_TOOL_NAME} first with a concrete reason, then retry one ${toolName} proposal.`,
-        };
-      }
-
-      let writeCandidatePath: string | undefined;
-      if (toolName === "write") {
-        await candidateFiles.clearSessionDirectory();
-        writeCandidatePath = await persistEditedProposal(
-          ctx.cwd,
-          "write",
-          proposedInput.path,
-          proposedInput as WriteInput,
-          await candidateFiles.ensureDirectory(ctx),
-        );
-      }
-
-      const review = await buildReviewData(ctx, toolName, proposedInput, writeCandidatePath);
-      if (toolName === "edit" && review.editPreviewValidation && !review.editPreviewValidation.canApprove) {
-        await clearPendingEditedProposal();
-
-        if (review.editPreviewValidation.missingTarget) {
-          const missingTargetCandidatePath = await persistEditedProposal(
-            ctx.cwd,
-            "edit",
-            review.path,
-            proposedInput as EditInput,
-            await candidateFiles.ensureDirectory(ctx),
-          );
-          pendingEditedProposalPath = missingTargetCandidatePath;
-          setPendingReadRequirements(missingTargetCandidatePath);
-          ctx.ui.notify(
-            `Preview warning for edit ${review.path}; target file is missing, switching to candidate-file replanning.`,
-            "warning",
-          );
-          return {
-            block: true,
-            reason: buildMissingTargetEditInstruction(review.path, proposedInput as EditInput, missingTargetCandidatePath),
-          };
-        }
-
-        setPendingReadRequirements(review.path);
-        ctx.ui.notify(
-          `Preview warning for edit ${review.path}; automatic read-first replanning guidance applied.`,
-          "warning",
-        );
-        return {
-          block: true,
-          reason: buildBlockedEditApprovalInstruction(review.path, proposedInput as EditInput, review),
-        };
-      }
-
-      const action = await handleReviewAction(ctx, review);
-
-      if (action === "approve") {
-        return undefined;
-      }
-
-      if (action === "deny") {
-        denyHold = true;
-        await clearReadRequirements();
-        ctx.abort();
-        return {
-          block: true,
-          reason: "",
-        };
-      }
-
-      if (typeof action === "object" && action.action === "steer") {
-        const message = buildSteeringInstruction(toolName, review.path, action.steering, writeCandidatePath);
-        if (!message) {
-          ctx.ui.notify("Enter steering instructions to send feedback to the agent.", "warning");
-          continue;
-        }
-
-        const sent = sendSteeringFeedback(message);
-        return { block: true, reason: sent ? "" : message };
-      }
-
-      const updated = await editProposal(ctx, toolName, proposedInput);
-      if (!updated) {
-        continue;
-      }
-
-      await clearPendingEditedProposal();
-      const editedProposalPath = await persistEditedProposal(
-        ctx.cwd,
-        toolName,
-        review.path,
-        updated,
-        await candidateFiles.ensureDirectory(ctx),
-      );
-      const requireTargetRead = await pathExists(resolve(ctx.cwd, review.path));
-      pendingEditedProposalPath = editedProposalPath;
-      setPendingReadRequirements(requireTargetRead ? review.path : undefined, editedProposalPath);
-      return {
-        block: true,
-        reason: buildEditedProposalInstruction(toolName, review.path, editedProposalPath, requireTargetRead),
-      };
-    }
+    return handleReviewToolCall(event, ctx, {
+      state,
+      reasonToolName: DIFFLOOP_REASON_TOOL_NAME,
+      normalizeReasonValue,
+      normalizeToolCallInput,
+      sanitizeToolCallInput,
+      buildReviewData,
+      editProposal,
+      sendSteeringFeedback,
+      blockWithReason,
+      onDecision: (decision) => {
+        appendDiffloopAudit(pi, {
+          kind: "decision",
+          action: decision.action,
+          toolName: decision.toolName,
+          path: decision.path,
+          reason: decision.reason,
+        });
+      },
+      onDenyAbort: (pipelineCtx) => {
+        pipelineCtx.abort();
+      },
+    });
   });
 
   pi.on("tool_result", async (event, ctx) => {
+    if (isWriteToolResult(event)) {
+      const inputPath = typeof event.input?.path === "string" ? event.input.path : undefined;
+      const pendingWriteOverride = state.consumePendingWriteOverride(event.toolCallId, inputPath);
+      if (pendingWriteOverride && !event.isError) {
+        const absolutePath = resolve(ctx.cwd, normalizePath(pendingWriteOverride.path));
+        await mkdir(dirname(absolutePath), { recursive: true });
+        await writeFile(absolutePath, pendingWriteOverride.content, "utf8");
+      }
+    }
+
     const isEditOrWriteError = (event.toolName === "edit" || event.toolName === "write") && event.isError;
     if (isEditOrWriteError) {
       const failedPath = typeof event.input?.path === "string" ? normalizePath(event.input.path) : "";
       if (!failedPath) return undefined;
 
-      await clearPendingEditedProposal();
-      setPendingReadRequirements(failedPath);
+      state.setPendingReadRequirements(failedPath);
+      appendDiffloopAudit(pi, {
+        kind: "recovery",
+        toolName: event.toolName === "edit" ? "edit" : "write",
+        path: failedPath,
+        isError: true,
+      });
 
       if (ctx.hasUI) {
         ctx.ui.notify(
@@ -505,16 +318,6 @@ export default function reviewChanges(pi: ExtensionAPI) {
         ],
       };
     }
-
-    const isSuccessfulReadOfEditedProposal =
-      event.toolName === "read" &&
-      Boolean(pendingEditedProposalReadToolCallId) &&
-      event.toolCallId === pendingEditedProposalReadToolCallId &&
-      !event.isError;
-
-    if (!isSuccessfulReadOfEditedProposal) return undefined;
-
-    await clearPendingEditedProposal();
     return undefined;
   });
 }
@@ -523,7 +326,6 @@ async function buildReviewData(
   ctx: ExtensionContext,
   toolName: "write" | "edit",
   input: WriteInput | EditInput,
-  candidatePath?: string,
 ): Promise<ReviewData> {
   const path = normalizePath(input.path);
   const reason = input.reason.trim() || "(no reason provided)";
@@ -544,7 +346,6 @@ async function buildReviewData(
     const summary = [
       existingContent === undefined ? "Operation: create new file" : "Operation: overwrite existing file",
       `Size: ${writeInput.content.length} characters across ${contentLines} lines`,
-      ...(candidatePath ? [`Candidate file: ${candidatePath}`] : []),
     ];
 
     const warningLines = nativeWritePreview.ok
@@ -571,7 +372,7 @@ async function buildReviewData(
 
   if (existingContent === undefined) {
     const validationErrors = ["Target file was not found on disk."];
-    const candidatePreview = await buildEditedProposalCandidate(ctx.cwd, "edit", path, editInput);
+    const candidatePreview = buildMissingTargetPreview(editInput);
     return {
       toolName,
       path,
@@ -579,7 +380,7 @@ async function buildReviewData(
       summary: [
         ...summary,
         "Preview warning: target file does not exist on disk",
-        "Fallback preview: generated candidate content from proposed edit blocks",
+        "Fallback preview: generated from proposed edit newText blocks",
       ],
       editPreviewValidation: {
         canApprove: false,
@@ -591,7 +392,7 @@ async function buildReviewData(
           title: "Candidate content preview (target file missing)",
           lines: [
             { kind: "warning", text: "! Unable to compute file diff because the target file was not found." },
-            { kind: "warning", text: "! Approval is blocked for edit on missing files; replan with write using candidate content." },
+            { kind: "warning", text: "! Approval is blocked for edit on missing files; submit a write proposal instead." },
             ...buildWriteContentPreview(candidatePreview),
           ],
           diffModel: buildStructuredDiff("", candidatePreview),
@@ -652,6 +453,12 @@ async function buildReviewData(
       },
     ],
   };
+}
+
+function buildMissingTargetPreview(input: EditInput): string {
+  const normalized = normalizeEditInput(input);
+  if (normalized.edits.length === 0) return "";
+  return normalized.edits.map((edit) => edit.newText).join("\n");
 }
 
 
@@ -908,6 +715,7 @@ function displayDiffloopStatus(
   enabled: boolean,
   announce = false,
   availableUpdateVersion?: string,
+  auditStatsSuffix = "",
 ) {
   if (!ctx.hasUI) return;
 
@@ -916,7 +724,7 @@ function displayDiffloopStatus(
     ? ctx.ui.theme.fg("accent", ` update v${availableUpdateVersion} available`)
     : "";
 
-  ctx.ui.setStatus(DIFFLOOP_REVIEW_STATUS, `${baseStatusText}${updateStatusText}`);
+  ctx.ui.setStatus(DIFFLOOP_REVIEW_STATUS, `${baseStatusText}${updateStatusText}${auditStatsSuffix}`);
   if (announce) {
     ctx.ui.notify(`Diffloop ${enabled ? "on" : "off"}`, enabled ? "warning" : "info");
   }

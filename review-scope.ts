@@ -156,14 +156,6 @@ export function loadDiffloopConfig(configPath = resolveDiffloopConfigPath()): Di
   }
 }
 
-export function createReviewScopeFromConfig(configPath = resolveDiffloopConfigPath()): ReviewScope {
-  return loadDiffloopConfig(configPath).reviewScope;
-}
-
-export function readEnabledFromConfig(configPath = resolveDiffloopConfigPath()): boolean {
-  return loadDiffloopConfig(configPath).enabled;
-}
-
 export function saveEnabledToConfig(enabled: boolean, configPath = resolveDiffloopConfigPath()): void {
   let base: Record<string, unknown> = {};
 
