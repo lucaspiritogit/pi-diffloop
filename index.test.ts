@@ -756,121 +756,146 @@ describe("reviewChanges", () => {
 
 	test("sends steering feedback from the review UI without opening a separate input dialog", async () => {
 		const { toolCall, sentMessages } = createReviewHarness();
-		const event = {
-			toolName: "edit",
-			input: {
-				path: "@src/file.ts",
-				reason: "Tighten the branch condition",
-				edits: [{ oldText: "if (old)", newText: "if (new)" }],
-			},
-		};
+		const directory = await mkdtemp(join(tmpdir(), "diffloop-steer-review-"));
 
-		const result = await toolCall(event, {
-			hasUI: true,
-			cwd: process.cwd(),
-			isIdle: () => true,
-			ui: {
-				custom: async () => ({ action: "steer", steering: "preserve comments and keep the fallback path unchanged" }),
-				input: async () => {
-					throw new Error("steering should stay inside the review UI");
+		try {
+			await mkdir(join(directory, "src"), { recursive: true });
+			await writeFile(join(directory, "src/file.ts"), "if (old) {\n  return 1;\n}\n");
+
+			const event = {
+				toolName: "edit",
+				input: {
+					path: "@src/file.ts",
+					reason: "Tighten the branch condition",
+					edits: [{ oldText: "if (old)", newText: "if (new)" }],
 				},
-				notify() {},
-			},
-		} as any);
+			};
 
-		expectBlockedWithReason(result);
-		expect(sentMessages).toEqual([]);
+			const result = await toolCall(event, {
+				hasUI: true,
+				cwd: directory,
+				isIdle: () => true,
+				ui: {
+					custom: async () => ({ action: "steer", steering: "preserve comments and keep the fallback path unchanged" }),
+					input: async () => {
+						throw new Error("steering should stay inside the review UI");
+					},
+					notify() {},
+				},
+			} as any);
+
+			expectBlockedWithReason(result);
+			expect(sentMessages).toEqual([]);
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
 	});
 
 	test("does not require a read call after steering before allowing a new edit/write", async () => {
 		const { toolCall } = createReviewHarness();
+		const directory = await mkdtemp(join(tmpdir(), "diffloop-steer-read-"));
 
-		await toolCall(
-			{
-				toolName: "edit",
-				input: {
-					path: "@src/file.ts",
-					reason: "Initial proposal",
-					edits: [{ oldText: "old", newText: "new" }],
-				},
-			},
-			{
-				hasUI: true,
-				cwd: process.cwd(),
-				isIdle: () => true,
-				ui: {
-					custom: async () => ({ action: "steer", steering: "refine" }),
-					notify() {},
-				},
-			} as any,
-		);
+		try {
+			await mkdir(join(directory, "src"), { recursive: true });
+			await writeFile(join(directory, "src/file.ts"), "old\n");
 
-		const result = await toolCall(
-			{
-				toolName: "write",
-				input: { path: "@src/file.ts", reason: "Try write", content: "next" },
-			},
-			{
-				hasUI: true,
-				cwd: process.cwd(),
-				isIdle: () => true,
-				ui: {
-					custom: async () => "approve",
-					notify() {},
+			await toolCall(
+				{
+					toolName: "edit",
+					input: {
+						path: "@src/file.ts",
+						reason: "Initial proposal",
+						edits: [{ oldText: "old", newText: "new" }],
+					},
 				},
-			} as any,
-		);
+				{
+					hasUI: true,
+					cwd: directory,
+					isIdle: () => true,
+					ui: {
+						custom: async () => ({ action: "steer", steering: "refine" }),
+						notify() {},
+					},
+				} as any,
+			);
 
-		expect(result).toBeUndefined();
+			const result = await toolCall(
+				{
+					toolName: "write",
+					input: { path: "@src/file.ts", reason: "Try write", content: "next" },
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					isIdle: () => true,
+					ui: {
+						custom: async () => "approve",
+						notify() {},
+					},
+				} as any,
+			);
+
+			expect(result).toBeUndefined();
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
 	});
 
 	test("deny aborts current execution and blocks tool calls until a new user input arrives", async () => {
 		const { toolCall, input } = createReviewHarness();
 		let aborted = false;
+		const directory = await mkdtemp(join(tmpdir(), "diffloop-deny-review-"));
 
-		const denied = await toolCall(
-			{
-				toolName: "edit",
-				input: {
-					path: "@src/file.ts",
-					reason: "Deny this",
-					edits: [{ oldText: "old", newText: "new" }],
-				},
-			},
-			{
-				hasUI: true,
-				cwd: process.cwd(),
-				abort() {
-					aborted = true;
-				},
-				isIdle: () => true,
-				ui: {
-					custom: async () => "deny",
-					notify() {},
-				},
-			} as any,
-		);
+		try {
+			await mkdir(join(directory, "src"), { recursive: true });
+			await writeFile(join(directory, "src/file.ts"), "old\n");
 
-		expect(aborted).toBe(true);
-		expectBlockedWithReason(denied);
-
-		const blocked = await toolCall(
-			{
-				toolName: "write",
-				input: {
-					path: "@notes.txt",
-					reason: "Should not run",
-					content: "x",
+			const denied = await toolCall(
+				{
+					toolName: "edit",
+					input: {
+						path: "@src/file.ts",
+						reason: "Deny this",
+						edits: [{ oldText: "old", newText: "new" }],
+					},
 				},
-			},
-			{
-				hasUI: true,
-				cwd: process.cwd(),
-				ui: { notify() {} },
-			} as any,
-		);
+				{
+					hasUI: true,
+					cwd: directory,
+					abort() {
+						aborted = true;
+					},
+					isIdle: () => true,
+					ui: {
+						custom: async () => "deny",
+						notify() {},
+					},
+				} as any,
+			);
 
-		expectBlockedWithReason(blocked);
+			expect(aborted).toBe(true);
+			expectBlockedWithReason(denied);
+
+			const blocked = await toolCall(
+				{
+					toolName: "write",
+					input: {
+						path: "@notes.txt",
+						reason: "Should not run",
+						content: "x",
+					},
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					ui: { notify() {} },
+				} as any,
+			);
+
+			expectBlockedWithReason(blocked);
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
 
 		await input(
 			{
@@ -993,7 +1018,7 @@ describe("reviewChanges", () => {
 		}
 	});
 
-	test("blocks approve for invalid edit previews and returns read-first replanning guidance", async () => {
+	test("blocks invalid edit previews before opening review and returns read-first replanning guidance", async () => {
 		const { toolCall, sentMessages } = createReviewHarness();
 		const directory = await mkdtemp(join(tmpdir(), "diffloop-auto-steer-"));
 
@@ -1015,7 +1040,9 @@ describe("reviewChanges", () => {
 					cwd: directory,
 					isIdle: () => true,
 					ui: {
-						custom: async () => "approve",
+						custom: async () => {
+							throw new Error("invalid previews should block before opening review UI");
+						},
 						notify() {},
 					},
 				} as any,
@@ -1042,7 +1069,7 @@ describe("reviewChanges", () => {
 		}
 	});
 
-	test("blocks approve for edits on missing files and routes replanning through candidate files", async () => {
+	test("blocks missing-target edits before opening review and routes replanning through candidate files", async () => {
 		const { toolCall, toolResult } = createReviewHarness();
 		const directory = await mkdtemp(join(tmpdir(), "diffloop-missing-target-"));
 
@@ -1063,7 +1090,9 @@ describe("reviewChanges", () => {
 					cwd: directory,
 					isIdle: () => true,
 					ui: {
-						custom: async () => "approve",
+						custom: async () => {
+							throw new Error("missing-target previews should block before opening review UI");
+						},
 						notify() {},
 					},
 				} as any,

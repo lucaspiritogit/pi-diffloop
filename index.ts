@@ -386,18 +386,10 @@ export default function reviewChanges(pi: ExtensionAPI) {
       }
 
       const review = await buildReviewData(ctx, toolName, proposedInput, writeCandidatePath);
-
-      const action = await handleReviewAction(ctx, review);
-
-      if (action === "approve") {
-        const editPreviewValidation = review.editPreviewValidation;
-        if (!editPreviewValidation || editPreviewValidation.canApprove) {
-          return undefined;
-        }
-
+      if (toolName === "edit" && review.editPreviewValidation && !review.editPreviewValidation.canApprove) {
         await clearPendingEditedProposal();
 
-        if (editPreviewValidation.missingTarget) {
+        if (review.editPreviewValidation.missingTarget) {
           const missingTargetCandidatePath = await persistEditedProposal(
             ctx.cwd,
             "edit",
@@ -408,7 +400,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
           pendingEditedProposalPath = missingTargetCandidatePath;
           setPendingReadRequirements(missingTargetCandidatePath);
           ctx.ui.notify(
-            `Approval blocked for edit ${review.path}; target file is missing, switching to candidate-file replanning.`,
+            `Preview warning for edit ${review.path}; target file is missing, switching to candidate-file replanning.`,
             "warning",
           );
           return {
@@ -418,11 +410,20 @@ export default function reviewChanges(pi: ExtensionAPI) {
         }
 
         setPendingReadRequirements(review.path);
-        ctx.ui.notify(`Approval blocked for edit ${review.path}; automatic replanning guidance applied.`, "warning");
+        ctx.ui.notify(
+          `Preview warning for edit ${review.path}; automatic read-first replanning guidance applied.`,
+          "warning",
+        );
         return {
           block: true,
           reason: buildBlockedEditApprovalInstruction(review.path, proposedInput as EditInput, review),
         };
+      }
+
+      const action = await handleReviewAction(ctx, review);
+
+      if (action === "approve") {
+        return undefined;
       }
 
       if (action === "deny") {
