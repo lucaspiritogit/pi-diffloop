@@ -481,14 +481,6 @@ async function buildReviewData(
     summary.push("Approval guard: invalid native preview; approve will trigger automatic read-first replanning");
   }
 
-  if (diff) {
-    if (diff.hasChanges) {
-      summary.push(`Diff: +${diff.additions} / -${diff.removals} across ${Math.max(1, diff.hunks)} hunk(s)`);
-    } else {
-      summary.push("Diff: no textual changes");
-    }
-  }
-
   return {
     toolName,
     path,
