@@ -15,6 +15,7 @@
   },
   "files": [
     "dist",
+    "diffloop-config.json",
     "README.md",
     "LICENSE"
   ],

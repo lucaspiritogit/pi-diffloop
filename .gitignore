@@ -16,3 +16,4 @@ logs
 .DS_Store
 .idea
 .vscode
+diffloop-config.json

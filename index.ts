@@ -25,7 +25,7 @@ import {
   runNativeWritePreview,
 } from "./diff-preview";
 import { handleReviewAction } from "./review-ui";
-import { createReviewScopeFromEnv, isPathInReviewScope } from "./review-scope";
+import { isPathInReviewScope, loadDiffloopConfig, saveEnabledToConfig } from "./review-scope";
 import type { EditBlock, EditInput, NativeEditBlockStatus, ReviewData, WriteInput } from "./review-types";
 import { buildStructuredDiff } from "./structured-diff";
 import {
@@ -91,14 +91,19 @@ export default function reviewChanges(pi: ExtensionAPI) {
   registerCandidateFilesProcessCleanup();
   void clearStaleCandidateDirectories();
 
-  let enabled = true;
-  const reviewScope = createReviewScopeFromEnv();
+  let { enabled, reviewScope } = loadDiffloopConfig();
   const pendingReadPaths = new Set<string>();
   let pendingEditedProposalPath: string | undefined;
   let pendingEditedProposalReadToolCallId: string | undefined;
   let denyHold = false;
   const candidateFiles = createCandidateFilesSessionManager();
   let availableUpdateVersion: string | undefined;
+
+  const refreshDiffloopConfig = () => {
+    const nextConfig = loadDiffloopConfig();
+    enabled = nextConfig.enabled;
+    reviewScope = nextConfig.reviewScope;
+  };
 
   const clearPendingEditedProposal = async () => {
     pendingEditedProposalPath = undefined;
@@ -177,6 +182,15 @@ export default function reviewChanges(pi: ExtensionAPI) {
       if (action === "on") enabled = true;
       if (action === "off") enabled = false;
 
+      if (action !== "status") {
+        try {
+          saveEnabledToConfig(enabled);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          ctx.ui.notify(`Failed to persist diffloop state: ${message}`, "warning");
+        }
+      }
+
       if (wasEnabled && !enabled) {
         denyHold = false;
         clearPendingChangeReasons();
@@ -216,6 +230,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
   });
 
   pi.on("session_start", async (_event, ctx) => {
+    refreshDiffloopConfig();
     clearPendingChangeReasons();
     await candidateFiles.clearSessionDirectory();
     candidateFiles.setSessionFromContext(ctx);
@@ -334,6 +349,7 @@ export default function reviewChanges(pi: ExtensionAPI) {
       }
 
       const normalizedInputPath = proposedInput.path;
+      refreshDiffloopConfig();
       if (!isPathInReviewScope(normalizedInputPath, reviewScope)) {
         consumePendingChangeReason();
         return undefined;

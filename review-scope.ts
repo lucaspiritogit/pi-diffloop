@@ -1,4 +1,5 @@
-import { basename, extname } from "node:path";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { basename, extname, join, resolve } from "node:path";
 import { normalizePath } from "./utils";
 
 export type ReviewScope = {
@@ -8,17 +9,42 @@ export type ReviewScope = {
   excludeExtensions: string[];
 };
 
-const INCLUDE_PATTERNS_ENV = "DIFFLOOP_REVIEW_INCLUDE";
-const EXCLUDE_PATTERNS_ENV = "DIFFLOOP_REVIEW_EXCLUDE";
-const INCLUDE_EXTENSIONS_ENV = "DIFFLOOP_REVIEW_INCLUDE_EXTENSIONS";
-const EXCLUDE_EXTENSIONS_ENV = "DIFFLOOP_REVIEW_EXCLUDE_EXTENSIONS";
+type ReviewScopeConfigShape = Partial<{
+  includePatterns: unknown;
+  excludePatterns: unknown;
+  includeExtensions: unknown;
+  excludeExtensions: unknown;
+}>;
 
-function parseCsv(input?: string): string[] {
-  if (!input) return [];
-  return input
-    .split(",")
-    .map((value) => value.trim())
-    .filter(Boolean);
+type DiffloopConfigShape = Partial<{
+  enabled: unknown;
+  reviewScope: ReviewScopeConfigShape;
+}> &
+  ReviewScopeConfigShape;
+
+export type DiffloopConfig = {
+  enabled: boolean;
+  reviewScope: ReviewScope;
+};
+
+export const DIFFLOOP_CONFIG_FILE_NAME = "diffloop-config.json";
+
+function parseList(input: unknown): string[] {
+  if (Array.isArray(input)) {
+    return input
+      .filter((value): value is string => typeof value === "string")
+      .map((value) => value.trim())
+      .filter(Boolean);
+  }
+
+  if (typeof input === "string") {
+    return input
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
+  }
+
+  return [];
 }
 
 function normalizeScopePath(value: string): string {
@@ -78,21 +104,80 @@ function matchesPattern(path: string, pattern: string): boolean {
   return matcher.test(basename(normalizedPath)) || matcher.test(normalizedPath);
 }
 
-export function createReviewScopeFromEnv(env: NodeJS.ProcessEnv = process.env): ReviewScope {
-  const includeExtensions = parseCsv(env[INCLUDE_EXTENSIONS_ENV])
+export function resolveDiffloopConfigPath(baseDir = __dirname): string {
+  const localPath = join(baseDir, DIFFLOOP_CONFIG_FILE_NAME);
+  if (existsSync(localPath)) return localPath;
+
+  return resolve(baseDir, "..", DIFFLOOP_CONFIG_FILE_NAME);
+}
+
+function parseReviewScopeConfig(rawConfig: unknown): ReviewScope {
+  const objectConfig = typeof rawConfig === "object" && rawConfig !== null ? (rawConfig as DiffloopConfigShape) : {};
+  const source =
+    typeof objectConfig.reviewScope === "object" && objectConfig.reviewScope !== null
+      ? objectConfig.reviewScope
+      : objectConfig;
+
+  const includeExtensions = parseList(source.includeExtensions)
     .map(normalizeExtension)
     .filter((ext): ext is string => Boolean(ext));
 
-  const excludeExtensions = parseCsv(env[EXCLUDE_EXTENSIONS_ENV])
+  const excludeExtensions = parseList(source.excludeExtensions)
     .map(normalizeExtension)
     .filter((ext): ext is string => Boolean(ext));
 
   return {
-    includePatterns: parseCsv(env[INCLUDE_PATTERNS_ENV]).map(normalizePattern),
-    excludePatterns: parseCsv(env[EXCLUDE_PATTERNS_ENV]).map(normalizePattern),
+    includePatterns: parseList(source.includePatterns).map(normalizePattern),
+    excludePatterns: parseList(source.excludePatterns).map(normalizePattern),
     includeExtensions,
     excludeExtensions,
   };
+}
+
+function parseEnabled(rawConfig: unknown): boolean {
+  if (!rawConfig || typeof rawConfig !== "object") return true;
+  const enabledValue = (rawConfig as DiffloopConfigShape).enabled;
+  return typeof enabledValue === "boolean" ? enabledValue : true;
+}
+
+export function loadDiffloopConfig(configPath = resolveDiffloopConfigPath()): DiffloopConfig {
+  try {
+    const raw = readFileSync(configPath, "utf8");
+    const parsed = JSON.parse(raw);
+    return {
+      enabled: parseEnabled(parsed),
+      reviewScope: parseReviewScopeConfig(parsed),
+    };
+  } catch {
+    return {
+      enabled: true,
+      reviewScope: parseReviewScopeConfig({}),
+    };
+  }
+}
+
+export function createReviewScopeFromConfig(configPath = resolveDiffloopConfigPath()): ReviewScope {
+  return loadDiffloopConfig(configPath).reviewScope;
+}
+
+export function readEnabledFromConfig(configPath = resolveDiffloopConfigPath()): boolean {
+  return loadDiffloopConfig(configPath).enabled;
+}
+
+export function saveEnabledToConfig(enabled: boolean, configPath = resolveDiffloopConfigPath()): void {
+  let base: Record<string, unknown> = {};
+
+  try {
+    const raw = readFileSync(configPath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      base = { ...(parsed as Record<string, unknown>) };
+    }
+  } catch {
+  }
+
+  base.enabled = enabled;
+  writeFileSync(configPath, `${JSON.stringify(base, null, 2)}\n`, "utf8");
 }
 
 export function isPathInReviewScope(path: string, scope: ReviewScope): boolean {

@@ -62,22 +62,20 @@ When the agent proposes an `edit` or `write`:
 
 By default, diffloop reviews all `edit` and `write` proposals.
 
-You can scope review to specific files using env vars:
+You can scope review to specific files using `diffloop-config.json` in the extension folder.
 
-- `DIFFLOOP_REVIEW_INCLUDE` — comma-separated glob patterns to include
-- `DIFFLOOP_REVIEW_EXCLUDE` — comma-separated glob patterns to exclude
-- `DIFFLOOP_REVIEW_INCLUDE_EXTENSIONS` — comma-separated extensions to include (e.g. `.ts,.tsx`)
-- `DIFFLOOP_REVIEW_EXCLUDE_EXTENSIONS` — comma-separated extensions to exclude (e.g. `.lock,.snap`)
+Config shape:
 
-Examples:
-
-```bash
-# Review only TypeScript files
-export DIFFLOOP_REVIEW_INCLUDE="*.ts,*.tsx"
-
-# Or use extension filters directly
-export DIFFLOOP_REVIEW_INCLUDE_EXTENSIONS=".ts,.tsx"
-export DIFFLOOP_REVIEW_EXCLUDE_EXTENSIONS=".lock"
+```json
+{
+  "enabled": true,
+  "reviewScope": {
+    "includePatterns": ["*.ts", "*.tsx"],
+    "excludePatterns": ["**/*.snap"],
+    "includeExtensions": [".ts", ".tsx"],
+    "excludeExtensions": [".lock"]
+  }
+}
 ```
 
 Out-of-scope paths bypass diffloop review and run through Pi's normal tool execution.
@@ -121,6 +119,7 @@ It pushes the agent to provide reasons that are:
 ```
 
 When enabled, the footer shows the current status.
+The on/off state is persisted in `diffloop-config.json`, so `/diffloop off` remains off for future sessions until you run `/diffloop on`.
 
 ## Development
 

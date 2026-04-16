@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { access, mkdtemp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import reviewChanges, {
@@ -10,17 +10,24 @@ import reviewChanges, {
 	normalizeReviewModeAction,
 	normalizeEditArguments,
 } from "./index";
+import { resolveDiffloopConfigPath } from "./review-scope";
 import { buildStructuredDiff } from "./structured-diff";
 
 const CANDIDATE_FILES_DIR = join(tmpdir(), "diffloop", "candidate-files");
+const DIFFLOOP_CONFIG_PATH = resolveDiffloopConfigPath(__dirname);
 
 function createReviewHarness() {
 	const handlers = new Map<string, Function>();
+	let diffloopCommandHandler: ((args: string, ctx: any) => Promise<void>) | undefined;
 	const sentMessages: Array<{ message: string; options?: unknown }> = [];
 	const sentHiddenMessages: Array<{ message: unknown; options?: unknown }> = [];
 
 	reviewChanges({
-		registerCommand() {},
+		registerCommand(name: string, config: any) {
+			if (name === "diffloop" && typeof config?.handler === "function") {
+				diffloopCommandHandler = config.handler;
+			}
+		},
 		registerTool() {},
 		sendUserMessage(message: string, options?: unknown) {
 			sentMessages.push({ message, options });
@@ -39,7 +46,8 @@ function createReviewHarness() {
 	if (!toolResult) throw new Error("tool_result handler was not registered");
 	const input = handlers.get("input");
 	if (!input) throw new Error("input handler was not registered");
-	return { toolCall, toolResult, input, sentMessages, sentHiddenMessages };
+	if (!diffloopCommandHandler) throw new Error("diffloop command handler was not registered");
+	return { toolCall, toolResult, input, diffloopCommandHandler, sentMessages, sentHiddenMessages };
 }
 
 function registerToolCallHandler() {
@@ -72,6 +80,37 @@ async function directoryHasEntries(path: string): Promise<boolean> {
 	} catch {
 		return false;
 	}
+}
+
+async function readDiffloopConfigSnapshot(): Promise<string | undefined> {
+	try {
+		return await readFile(DIFFLOOP_CONFIG_PATH, "utf8");
+	} catch (error: any) {
+		if (error?.code === "ENOENT") return undefined;
+		throw error;
+	}
+}
+
+async function restoreDiffloopConfig(snapshot: string | undefined): Promise<void> {
+	if (snapshot === undefined) {
+		await rm(DIFFLOOP_CONFIG_PATH, { force: true });
+		return;
+	}
+
+	await writeFile(DIFFLOOP_CONFIG_PATH, snapshot, "utf8");
+}
+
+function createCommandCtx() {
+	return {
+		hasUI: true,
+		ui: {
+			notify() {},
+			setStatus() {},
+			theme: {
+				fg: (_token: string, text: string) => text,
+			},
+		},
+	} as any;
 }
 
 describe("prepareEditArguments", () => {
@@ -362,6 +401,123 @@ describe("reviewChanges", () => {
 		expect(handlers.has("tool_call")).toBe(true);
 	});
 
+	test("loads disabled mode from diffloop-config.json and bypasses review", async () => {
+		const configSnapshot = await readDiffloopConfigSnapshot();
+
+		try {
+			await writeFile(
+				DIFFLOOP_CONFIG_PATH,
+				`${JSON.stringify(
+					{
+						enabled: false,
+					},
+					null,
+					2,
+				)}\n`,
+				"utf8",
+			);
+
+			const { toolCall } = createReviewHarness();
+			const result = await toolCall(
+				{
+					toolName: "write",
+					input: {
+						path: "@notes.txt",
+						content: "first draft",
+					},
+				},
+				{
+					hasUI: true,
+					cwd: process.cwd(),
+					isIdle: () => true,
+					ui: {
+						custom: async () => {
+							throw new Error("review UI should not open while diffloop is disabled");
+						},
+						notify() {},
+					},
+				} as any,
+			);
+
+			expect(result).toBeUndefined();
+		} finally {
+			await restoreDiffloopConfig(configSnapshot);
+		}
+	});
+
+	test("persists /diffloop off and /diffloop on across new extension instances", async () => {
+		const configSnapshot = await readDiffloopConfigSnapshot();
+
+		try {
+			await writeFile(
+				DIFFLOOP_CONFIG_PATH,
+				`${JSON.stringify(
+					{
+						enabled: true,
+					},
+					null,
+					2,
+				)}\n`,
+				"utf8",
+			);
+
+			const first = createReviewHarness();
+			await first.diffloopCommandHandler("off", createCommandCtx());
+
+			const second = createReviewHarness();
+			const disabledResult = await second.toolCall(
+				{
+					toolName: "write",
+					input: {
+						path: "@notes.txt",
+						content: "first draft",
+					},
+				},
+				{
+					hasUI: true,
+					cwd: process.cwd(),
+					isIdle: () => true,
+					ui: {
+						custom: async () => {
+							throw new Error("review UI should not open while diffloop is disabled");
+						},
+						notify() {},
+					},
+				} as any,
+			);
+			expect(disabledResult).toBeUndefined();
+
+			await second.diffloopCommandHandler("on", createCommandCtx());
+
+			const third = createReviewHarness();
+			const enabledResult = await third.toolCall(
+				{
+					toolName: "write",
+					input: {
+						path: "@notes.txt",
+						content: "first draft",
+					},
+				},
+				{
+					hasUI: true,
+					cwd: process.cwd(),
+					isIdle: () => true,
+					ui: {
+						custom: async () => {
+							throw new Error("review should block before opening UI when reason is missing");
+						},
+						notify() {},
+					},
+				} as any,
+			);
+
+			expectBlockedWithReason(enabledResult);
+			expect((enabledResult as any).reason).toContain("set_change_reason");
+		} finally {
+			await restoreDiffloopConfig(configSnapshot);
+		}
+	});
+
 	test("allows write proposals with inline reason and strips non-native fields", async () => {
 		const toolCall = registerToolCallHandler();
 		const event = {
@@ -497,11 +653,24 @@ describe("reviewChanges", () => {
 		}
 	});
 
-	test("skips review for out-of-scope files via include patterns", async () => {
-		const previousInclude = process.env.DIFFLOOP_REVIEW_INCLUDE;
-		process.env.DIFFLOOP_REVIEW_INCLUDE = "*.ts";
+	test("skips review for out-of-scope files via diffloop-config.json include patterns", async () => {
+		const configSnapshot = await readDiffloopConfigSnapshot();
 
 		try {
+			await writeFile(
+				DIFFLOOP_CONFIG_PATH,
+				`${JSON.stringify(
+					{
+						reviewScope: {
+							includePatterns: ["*.ts"],
+						},
+					},
+					null,
+					2,
+				)}\n`,
+				"utf8",
+			);
+
 			const toolCall = registerToolCallHandler();
 			const outOfScope = await toolCall(
 				{
@@ -546,11 +715,7 @@ describe("reviewChanges", () => {
 			);
 			expect(inScope).toBeUndefined();
 		} finally {
-			if (previousInclude === undefined) {
-				delete process.env.DIFFLOOP_REVIEW_INCLUDE;
-			} else {
-				process.env.DIFFLOOP_REVIEW_INCLUDE = previousInclude;
-			}
+			await restoreDiffloopConfig(configSnapshot);
 		}
 	});
 
