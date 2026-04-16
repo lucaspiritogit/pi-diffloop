@@ -754,7 +754,7 @@ describe("reviewChanges", () => {
 		}
 	});
 
-	test("sends steering feedback from the review UI without opening a separate input dialog", async () => {
+	test("sends steering feedback once via deliverAs=steer without opening a separate input dialog", async () => {
 		const { toolCall, sentMessages } = createReviewHarness();
 		const directory = await mkdtemp(join(tmpdir(), "diffloop-steer-review-"));
 
@@ -785,7 +785,10 @@ describe("reviewChanges", () => {
 			} as any);
 
 			expectBlockedWithReason(result);
-			expect(sentMessages).toEqual([]);
+			expect(sentMessages).toHaveLength(1);
+			expect(sentMessages[0]?.message).toContain("Revise edit for src/file.ts.");
+			expect(sentMessages[0]?.options).toEqual(expect.objectContaining({ deliverAs: "steer" }));
+			expect((result as any).reason).toBe("");
 		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}

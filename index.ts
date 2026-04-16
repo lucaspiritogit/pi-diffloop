@@ -147,6 +147,15 @@ export default function reviewChanges(pi: ExtensionAPI) {
     return undefined;
   };
 
+  const sendSteeringFeedback = (message: string): boolean => {
+    try {
+      pi.sendUserMessage(message, { deliverAs: "steer" });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
   const syncReasonToolActivation = () => {
     const api = pi as Partial<Pick<ExtensionAPI, "getActiveTools" | "setActiveTools">>;
     if (typeof api.getActiveTools !== "function" || typeof api.setActiveTools !== "function") return;
@@ -443,7 +452,8 @@ export default function reviewChanges(pi: ExtensionAPI) {
           continue;
         }
 
-        return { block: true, reason: message };
+        const sent = sendSteeringFeedback(message);
+        return { block: true, reason: sent ? "" : message };
       }
 
       const updated = await editProposal(ctx, toolName, proposedInput);
