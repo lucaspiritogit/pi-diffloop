@@ -30,7 +30,6 @@ export type StructuredDiffGap = {
   hiddenRowCount: number;
   hiddenOldLines: number;
   hiddenNewLines: number;
-  label: string;
 };
 
 export type StructuredDiffVisibleItem = StructuredDiffVisibleRow | StructuredDiffGap;
@@ -67,10 +66,6 @@ const INLINE_HIGHLIGHT_CHAR_LIMIT = 800;
 function countLogicalLines(text: string): number {
   if (text.length === 0) return 0;
   return text.split("\n").length;
-}
-
-function pluralize(word: string, count: number): string {
-  return `${count.toLocaleString()} ${word}${count === 1 ? "" : "s"}`;
 }
 
 function normalizeDisplayText(text: string): string {
@@ -289,13 +284,6 @@ function buildAlignedRows(oldContent: string, newContent: string): {
   };
 }
 
-function createGapLabel(position: "start" | "middle" | "end", hiddenRows: number): string {
-  const hiddenText = pluralize("unchanged line", hiddenRows);
-  if (position === "start") return `Start of file · ${hiddenText}`;
-  if (position === "end") return `End of file · ${hiddenText}`;
-  return `… ${hiddenText} …`;
-}
-
 function getLineRange(
   rows: StructuredDiffRow[],
   startRow: number,
@@ -427,7 +415,6 @@ function buildStructuredDiffFromRows(
         hiddenRowCount,
         hiddenOldLines: hiddenRowCount,
         hiddenNewLines: hiddenRowCount,
-        label: createGapLabel(cursor === 0 ? "start" : "middle", hiddenRowCount),
       });
     }
 
@@ -451,7 +438,6 @@ function buildStructuredDiffFromRows(
       hiddenRowCount,
       hiddenOldLines: hiddenRowCount,
       hiddenNewLines: hiddenRowCount,
-      label: createGapLabel(cursor === 0 ? "start" : "end", hiddenRowCount),
     });
   }
 

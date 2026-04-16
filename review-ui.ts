@@ -313,7 +313,6 @@ function renderStructuredDiffLines(
 
     for (const item of diff.visibleItems) {
       if (item.type === "gap") {
-        lines.push(centerAnsiText(theme.fg("dim", item.label), safeWidth));
         continue;
       }
 
@@ -331,7 +330,6 @@ function renderStructuredDiffLines(
 
   for (const item of diff.visibleItems) {
     if (item.type === "gap") {
-      lines.push(centerAnsiText(theme.fg("dim", item.label), safeWidth));
       continue;
     }
     lines.push(...renderUnifiedRow(theme, item.row, safeWidth, lineNumberWidth, syntaxLanguage));

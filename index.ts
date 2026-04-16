@@ -75,6 +75,14 @@ function normalizeReasonValue(reason: unknown): string {
   return typeof reason === "string" ? reason.trim() : "";
 }
 
+function buildReviewedMutationInstruction(toolName: "write" | "edit", path: string): string {
+  const normalizedPath = normalizePath(path) || "(unknown path)";
+  return [
+    `Diffloop applied the developer-reviewed ${toolName} proposal for ${normalizedPath}.`,
+    "Treat the current on-disk file content as the source of truth and do not reapply the previous draft.",
+  ].join(" ");
+}
+
 export default function reviewChanges(pi: ExtensionAPI) {
   const state = createDiffloopRuntimeState(loadDiffloopConfig());
   let availableUpdateVersion: string | undefined;
@@ -278,13 +286,40 @@ export default function reviewChanges(pi: ExtensionAPI) {
   });
 
   pi.on("tool_result", async (event, ctx) => {
+    const inputPath = typeof event.input?.path === "string" ? event.input.path : undefined;
+    const pendingReviewedMutation =
+      event.toolName === "write" || event.toolName === "edit"
+        ? state.consumePendingReviewedMutation(event.toolName, event.toolCallId, inputPath)
+        : undefined;
+
     if (isWriteToolResult(event)) {
-      const inputPath = typeof event.input?.path === "string" ? event.input.path : undefined;
       const pendingWriteOverride = state.consumePendingWriteOverride(event.toolCallId, inputPath);
       if (pendingWriteOverride && !event.isError) {
-        const absolutePath = resolve(ctx.cwd, normalizePath(pendingWriteOverride.path));
-        await mkdir(dirname(absolutePath), { recursive: true });
-        await writeFile(absolutePath, pendingWriteOverride.content, "utf8");
+        const normalizedOverridePath = normalizePath(pendingWriteOverride.path || inputPath || "");
+        const absolutePath = resolve(ctx.cwd, normalizedOverridePath);
+        try {
+          await mkdir(dirname(absolutePath), { recursive: true });
+          await writeFile(absolutePath, pendingWriteOverride.content, "utf8");
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (ctx.hasUI) {
+            ctx.ui.notify(
+              `Failed to apply reviewed write override for ${normalizedOverridePath}: ${message}`,
+              "warning",
+            );
+          }
+          return {
+            content: [
+              ...event.content,
+              {
+                type: "text" as const,
+                text: `Diffloop warning: failed to apply reviewed write override for ${normalizedOverridePath}: ${message}`,
+              },
+            ],
+            details: event.details,
+          };
+        }
+
       }
     }
 
@@ -316,6 +351,24 @@ export default function reviewChanges(pi: ExtensionAPI) {
             text: `Diffloop recovery: read ${failedPath} and then submit one revised ${event.toolName} proposal.`,
           },
         ],
+      };
+    }
+
+    if (!event.isError && pendingReviewedMutation) {
+      const reviewedMutationInstruction = buildReviewedMutationInstruction(
+        pendingReviewedMutation.toolName,
+        pendingReviewedMutation.path || inputPath || "",
+      );
+      sendSteeringFeedback(reviewedMutationInstruction);
+      return {
+        content: [
+          ...event.content,
+          {
+            type: "text" as const,
+            text: reviewedMutationInstruction,
+          },
+        ],
+        details: event.details,
       };
     }
     return undefined;

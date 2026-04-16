@@ -105,6 +105,7 @@ export async function handleReviewToolCall(
   const toolName = event.toolName;
   let resolvedChangeReason: string | undefined;
   let pendingEditedWriteInput: WriteInput | undefined;
+  let proposalEditedInReview = false;
 
   if (!ctx.hasUI) {
     return deps.blockWithReason(
@@ -201,6 +202,12 @@ export async function handleReviewToolCall(
         deps.sanitizeToolCallInput(event, toolName, pendingEditedWriteInput);
         deps.state.queuePendingWriteOverride(event.toolCallId, pendingEditedWriteInput.path, pendingEditedWriteInput.content);
       }
+      if (proposalEditedInReview) {
+        const approvedPath = normalizePath(
+          toolName === "write" && pendingEditedWriteInput ? pendingEditedWriteInput.path : proposedInput.path,
+        );
+        deps.state.queuePendingReviewedMutation(toolName, event.toolCallId, approvedPath);
+      }
       deps.onDecision({
         action: "approve",
         toolName,
@@ -251,6 +258,7 @@ export async function handleReviewToolCall(
     if (toolName === "write") {
       pendingEditedWriteInput = updated as WriteInput;
     }
+    proposalEditedInReview = true;
 
     deps.sanitizeToolCallInput(event, toolName, updated);
     deps.onDecision({

@@ -1266,7 +1266,7 @@ describe("reviewChanges", () => {
 	});
 
 	test("applies approved edited write content on tool_result even if original write payload ran", async () => {
-		const { toolCall, toolResult } = createReviewHarness();
+		const { toolCall, toolResult, sentMessages } = createReviewHarness();
 		const customResults = ["edit", "approve"];
 		const directory = await mkdtemp(join(tmpdir(), "diffloop-write-override-"));
 
@@ -1309,7 +1309,11 @@ describe("reviewChanges", () => {
 					ui: { notify() {} },
 				} as any,
 			);
-			expect(result).toBeUndefined();
+			const resultContent = ((result as any)?.content ?? []) as Array<{ text?: string }>;
+			expect(resultContent[resultContent.length - 1]?.text).toContain("developer-reviewed write proposal");
+			expect(sentMessages).toHaveLength(1);
+			expect(sentMessages[0]?.options).toEqual(expect.objectContaining({ deliverAs: "steer" }));
+			expect(sentMessages[0]?.message).toContain("source of truth");
 			expect(await readFile(join(directory, "notes.txt"), "utf8")).toBe("second draft");
 		} finally {
 			await rm(directory, { recursive: true, force: true });
@@ -1317,7 +1321,7 @@ describe("reviewChanges", () => {
 	});
 
 	test("applies approved edited write content on tool_result when toolCallId is missing", async () => {
-		const { toolCall, toolResult } = createReviewHarness();
+		const { toolCall, toolResult, sentMessages } = createReviewHarness();
 		const customResults = ["edit", "approve"];
 		const directory = await mkdtemp(join(tmpdir(), "diffloop-write-override-no-id-"));
 
@@ -1357,18 +1361,83 @@ describe("reviewChanges", () => {
 					cwd: directory,
 					ui: { notify() {} },
 				} as any,
-			);
-			expect(result).toBeUndefined();
-			expect(await readFile(join(directory, "notes.txt"), "utf8")).toBe("second draft");
+				);
+				const resultContent = ((result as any)?.content ?? []) as Array<{ text?: string }>;
+				expect(resultContent[resultContent.length - 1]?.text).toContain("developer-reviewed write proposal");
+				expect(sentMessages).toHaveLength(1);
+				expect(sentMessages[0]?.options).toEqual(expect.objectContaining({ deliverAs: "steer" }));
+				expect(await readFile(join(directory, "notes.txt"), "utf8")).toBe("second draft");
 		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}
 	});
 
-	test("re-reviews edited edit proposals before final approval", async () => {
-		const { toolCall, sentHiddenMessages } = createReviewHarness();
+	test("re-reviews edited edit proposals before final approval and sends source-of-truth feedback", async () => {
+		const { toolCall, toolResult, sentHiddenMessages, sentMessages } = createReviewHarness();
 		const customResults = ["edit", "approve"];
 		const directory = await mkdtemp(join(tmpdir(), "diffloop-edit-proposal-"));
+
+		try {
+			await mkdir(join(directory, "src"), { recursive: true });
+			await writeFile(join(directory, "src/file.ts"), "if (old) {\n\treturn old;\n}\n");
+
+			const event = {
+				toolName: "edit",
+				toolCallId: "edit-proposal-1",
+				input: {
+					path: "@src/file.ts",
+					reason: "Update the condition",
+					edits: [{ oldText: "if (old)", newText: "if (new)" }],
+				},
+			};
+
+			const result = await toolCall(event, {
+				hasUI: true,
+				cwd: directory,
+				isIdle: () => true,
+				ui: {
+					custom: async () => customResults.shift() ?? "approve",
+					editor: async () => "if (newer)",
+					notify() {},
+				},
+			} as any);
+
+			expect(result).toBeUndefined();
+			expect(event.input).toEqual({
+				path: "src/file.ts",
+				edits: [{ oldText: "if (old)", newText: "if (newer)" }],
+			});
+			expect(sentHiddenMessages).toEqual([]);
+
+			const postResult = await toolResult(
+				{
+					toolName: "edit",
+					toolCallId: "edit-proposal-1",
+					input: { path: "@src/file.ts" },
+					content: [{ type: "text", text: "edit ok" }],
+					details: {},
+					isError: false,
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					ui: { notify() {} },
+				} as any,
+			);
+			const postResultContent = ((postResult as any)?.content ?? []) as Array<{ text?: string }>;
+			expect(postResultContent[postResultContent.length - 1]?.text).toContain("developer-reviewed edit proposal");
+			expect(sentMessages).toHaveLength(1);
+			expect(sentMessages[0]?.options).toEqual(expect.objectContaining({ deliverAs: "steer" }));
+			expect(sentMessages[0]?.message).toContain("source of truth");
+		} finally {
+			await rm(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("sends reviewed edit feedback on tool_result when toolCallId is missing", async () => {
+		const { toolCall, toolResult, sentMessages } = createReviewHarness();
+		const customResults = ["edit", "approve"];
+		const directory = await mkdtemp(join(tmpdir(), "diffloop-edit-proposal-no-id-"));
 
 		try {
 			await mkdir(join(directory, "src"), { recursive: true });
@@ -1395,13 +1464,26 @@ describe("reviewChanges", () => {
 			} as any);
 
 			expect(result).toBeUndefined();
-			expect(event.input).toEqual({
-				path: "src/file.ts",
-				edits: [{ oldText: "if (old)", newText: "if (newer)" }],
-			});
-			expect(sentHiddenMessages).toEqual([]);
+			const postResult = await toolResult(
+				{
+					toolName: "edit",
+					input: { path: "@src/file.ts" },
+					content: [{ type: "text", text: "edit ok" }],
+					details: {},
+					isError: false,
+				},
+				{
+					hasUI: true,
+					cwd: directory,
+					ui: { notify() {} },
+				} as any,
+			);
+			const postResultContent = ((postResult as any)?.content ?? []) as Array<{ text?: string }>;
+			expect(postResultContent[postResultContent.length - 1]?.text).toContain("developer-reviewed edit proposal");
+			expect(sentMessages).toHaveLength(1);
+			expect(sentMessages[0]?.options).toEqual(expect.objectContaining({ deliverAs: "steer" }));
 		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}
 	});
-});
+	});
