@@ -29,14 +29,17 @@
   "author": "",
   "license": "MIT",
   "type": "commonjs",
-  "dependencies": {},
+  "dependencies": {
+    "cli-highlight": "^2.1.11",
+    "diff": "^8.0.2"
+  },
   "pi": {
     "extensions": [
       "./dist/index.js"
     ]
   },
   "devDependencies": {
-    "@types/bun": "^1.3.11"
+    "@types/bun": "^1.3.12"
   },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",

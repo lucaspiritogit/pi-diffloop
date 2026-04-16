@@ -5,6 +5,76 @@ import type { DiffPreviewLine, EditBlock, NativeEditBlockStatus, NativeEditPrevi
 
 type NativeWritePreviewResult = { ok: true } | { ok: false; error: string };
 
+type PlannedEdit = {
+  index: number;
+  matchLength: number;
+  newText: string;
+};
+
+type EditApplicationResult = { ok: true; afterText: string } | { ok: false; error: string };
+
+function countOccurrences(content: string, target: string): number {
+  if (target.length === 0) return 0;
+  let count = 0;
+  let offset = 0;
+  while (offset <= content.length) {
+    const idx = content.indexOf(target, offset);
+    if (idx === -1) break;
+    count++;
+    offset = idx + target.length;
+  }
+  return count;
+}
+
+export function applyEditBlocksToContent(content: string, edits: EditBlock[]): EditApplicationResult {
+  if (!Array.isArray(edits) || edits.length === 0) {
+    return { ok: false, error: "No edit blocks were provided." };
+  }
+
+  const planned: PlannedEdit[] = [];
+  for (const [index, edit] of edits.entries()) {
+    if (!edit || typeof edit.oldText !== "string" || typeof edit.newText !== "string") {
+      return { ok: false, error: `Edit block ${index + 1} is missing oldText/newText.` };
+    }
+
+    if (edit.oldText.length === 0) {
+      return { ok: false, error: `Edit block ${index + 1} has an empty oldText.` };
+    }
+
+    const firstIndex = content.indexOf(edit.oldText);
+    if (firstIndex === -1) {
+      return { ok: false, error: `Edit block ${index + 1} oldText was not found in the target content.` };
+    }
+
+    const occurrences = countOccurrences(content, edit.oldText);
+    if (occurrences > 1) {
+      return { ok: false, error: `Edit block ${index + 1} oldText matched multiple locations.` };
+    }
+
+    planned.push({
+      index: firstIndex,
+      matchLength: edit.oldText.length,
+      newText: edit.newText,
+    });
+  }
+
+  const sorted = [...planned].sort((a, b) => a.index - b.index);
+  for (let i = 1; i < sorted.length; i++) {
+    const previous = sorted[i - 1]!;
+    const current = sorted[i]!;
+    if (current.index < previous.index + previous.matchLength) {
+      return { ok: false, error: "Some edit blocks overlap the same region." };
+    }
+  }
+
+  let next = content;
+  for (const edit of [...sorted].sort((a, b) => b.index - a.index)) {
+    next = next.slice(0, edit.index) + edit.newText + next.slice(edit.index + edit.matchLength);
+  }
+
+  return { ok: true, afterText: next };
+}
+
 export async function runNativeEditPreview(cwd: string, path: string, edits: EditBlock[]): Promise<NativeEditPreviewResult> {
   const nativeEdit = createEditToolDefinition(cwd, {
     operations: {

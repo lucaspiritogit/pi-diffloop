@@ -10,6 +10,7 @@ import reviewChanges, {
 	normalizeReviewModeAction,
 	normalizeEditArguments,
 } from "./index";
+import { buildStructuredDiff } from "./structured-diff";
 
 const CANDIDATE_FILES_DIR = join(tmpdir(), "diffloop", "candidate-files");
 
@@ -201,6 +202,7 @@ describe("buildSteeringInstruction", () => {
 describe("buildReviewBodyLines", () => {
 	const theme = {
 		fg: (_token: string, text: string) => text,
+		bg: (_token: string, text: string) => text,
 		bold: (text: string) => `**${text}**`,
 	} as any;
 
@@ -253,6 +255,78 @@ describe("buildReviewBodyLines", () => {
 				theme,
 			),
 		).toEqual(["No changes to preview."]);
+	});
+
+	test("renders structured diffs in side-by-side mode by default", () => {
+		const lines = buildReviewBodyLines(
+			{
+				toolName: "edit",
+				path: "src/file.ts",
+				reason: "Update file",
+				summary: [],
+				changes: [
+					{
+						title: "Structured diff",
+						lines: [{ kind: "warning", text: "! native preview warning" }],
+						diffModel: buildStructuredDiff("alpha\nbeta\n", "alpha\nBETA\n"),
+					},
+				],
+			} as any,
+			36,
+			theme,
+		);
+
+		expect(lines.some((line) => line.includes("Original"))).toBe(true);
+		expect(lines.some((line) => line.includes("Updated"))).toBe(true);
+		expect(lines.some((line) => line.includes("! native preview warning"))).toBe(true);
+	});
+
+	test("renders inline mode when explicitly requested", () => {
+		const lines = buildReviewBodyLines(
+			{
+				toolName: "edit",
+				path: "src/file.ts",
+				reason: "Update file",
+				summary: [],
+				changes: [
+					{
+						title: "Structured diff",
+						lines: [],
+						diffModel: buildStructuredDiff("alpha\nbeta\n", "alpha\nBETA\n"),
+					},
+				],
+			} as any,
+			36,
+			theme,
+			"inline",
+		);
+
+		expect(lines.some((line) => line.includes("Original"))).toBe(false);
+		expect(lines.some((line) => line.includes("beta"))).toBe(true);
+		expect(lines.some((line) => line.includes("BETA"))).toBe(true);
+	});
+
+	test("applies syntax token coloring for structured diffs when language is detected", () => {
+		const lines = buildReviewBodyLines(
+			{
+				toolName: "edit",
+				path: "src/example.ts",
+				reason: "Update code",
+				summary: [],
+				changes: [
+					{
+						title: "Structured diff",
+						lines: [],
+						diffModel: buildStructuredDiff("const value = 1;\n", "const value = 2;\n"),
+					},
+				],
+			} as any,
+			80,
+			theme,
+			"inline",
+		);
+
+		expect(lines.some((line) => line.includes("\x1b[38;5;"))).toBe(true);
 	});
 });
 

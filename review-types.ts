@@ -1,4 +1,5 @@
 import type { EditToolInput, WriteToolInput } from "@mariozechner/pi-coding-agent";
+import type { StructuredDiff } from "./structured-diff";
 
 export type DiffPreviewLineKind = "meta" | "context" | "add" | "remove" | "warning";
 
@@ -15,7 +16,7 @@ export type ReviewData = {
   path: string;
   reason: string;
   summary: string[];
-  changes: Array<{ title: string; lines: DiffPreviewLine[] }>;
+  changes: Array<{ title: string; lines: DiffPreviewLine[]; diffModel?: StructuredDiff }>;
   editPreviewValidation?: {
     canApprove: boolean;
     errors: string[];

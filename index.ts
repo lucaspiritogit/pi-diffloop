@@ -15,6 +15,7 @@ import {
   registerCandidateFilesProcessCleanup,
 } from "./candidate-files";
 import {
+  applyEditBlocksToContent,
   buildEditValidationErrors,
   buildNativePreviewWarnings,
   buildPreviewFromNativeEditDiff,
@@ -26,6 +27,7 @@ import {
 import { handleReviewAction } from "./review-ui";
 import { createReviewScopeFromEnv, isPathInReviewScope } from "./review-scope";
 import type { EditBlock, EditInput, NativeEditBlockStatus, ReviewData, WriteInput } from "./review-types";
+import { buildStructuredDiff } from "./structured-diff";
 import {
   buildBlockedEditApprovalInstruction,
   buildEditedProposalInstruction,
@@ -510,6 +512,7 @@ async function buildReviewData(
     const writeInput = input as WriteInput;
     const contentLines = writeInput.content.split("\n").length;
     const nativeWritePreview = await runNativeWritePreview(ctx.cwd, path, writeInput.content);
+    const diffModel = buildStructuredDiff(existingContent ?? "", writeInput.content);
 
     const summary = [
       existingContent === undefined ? "Operation: create new file" : "Operation: overwrite existing file",
@@ -530,6 +533,7 @@ async function buildReviewData(
         {
           title: existingContent === undefined ? "New file content preview" : "Replacement content preview",
           lines: [...warningLines, ...buildWriteContentPreview(writeInput.content)],
+          diffModel,
         },
       ],
     };
@@ -563,6 +567,7 @@ async function buildReviewData(
             { kind: "warning", text: "! Approval is blocked for edit on missing files; replan with write using candidate content." },
             ...buildWriteContentPreview(candidatePreview),
           ],
+          diffModel: buildStructuredDiff("", candidatePreview),
         },
       ],
     };
@@ -578,6 +583,8 @@ async function buildReviewData(
   ];
   const diff =
     preview.ok && typeof preview.diff === "string" ? buildPreviewFromNativeEditDiff(preview.diff) : undefined;
+  const appliedEditResult = applyEditBlocksToContent(existingContent, editInput.edits);
+  const diffModel = appliedEditResult.ok ? buildStructuredDiff(existingContent, appliedEditResult.afterText) : undefined;
 
   summary.push(`Preview match: ${validBlocks}/${editInput.edits.length} block(s) accepted by Pi's native edit tool`);
   if (invalidBlocks) {
@@ -614,6 +621,7 @@ async function buildReviewData(
       {
         title: "Unified diff against current file",
         lines: [...warningLines, ...(diff?.lines ?? [])],
+        diffModel,
       },
     ],
   };
