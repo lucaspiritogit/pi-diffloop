@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
-import { loadDiffloopConfig, type DiffloopConfig } from "./review-scope";
-import { normalizePath } from "./utils";
+import { loadDiffloopConfig, type DiffloopConfig } from "./review-scope.js";
+import { normalizePath } from "./utils.js";
 
 type PendingWriteOverride = {
   path: string;

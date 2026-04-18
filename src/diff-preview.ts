@@ -1,7 +1,7 @@
 import { createEditToolDefinition, createWriteToolDefinition } from "@mariozechner/pi-coding-agent";
 import { constants } from "node:fs";
 import { access, readFile } from "node:fs/promises";
-import type { DiffPreviewLine, EditBlock, NativeEditBlockStatus, NativeEditPreviewResult } from "./review-types";
+import type { DiffPreviewLine, EditBlock, NativeEditBlockStatus, NativeEditPreviewResult } from "./review-types.js";
 
 type NativeWritePreviewResult = { ok: true } | { ok: false; error: string };
 
@@ -223,7 +223,11 @@ export function buildEditValidationErrors(blockStatuses: NativeEditBlockStatus[]
 
   const errors: string[] = [];
   if (notFound > 0) {
-    errors.push(`${notFound} block(s) did not match the current file content.`);
+    if (previewError && notUnique === 0 && invalid === 0) {
+      errors.push(previewError);
+    } else {
+      errors.push(`${notFound} block(s) did not match the current file content.`);
+    }
   }
   if (notUnique > 0) {
     errors.push(`${notUnique} block(s) matched multiple locations; oldText must be unique.`);
@@ -231,7 +235,7 @@ export function buildEditValidationErrors(blockStatuses: NativeEditBlockStatus[]
   if (invalid > 0) {
     errors.push(`${invalid} block(s) were rejected by native preview validation.`);
   }
-  if (previewError) {
+  if (previewError && (notUnique > 0 || invalid > 0 || notFound === 0)) {
     errors.push(previewError);
   }
 

@@ -1,5 +1,5 @@
-import type { EditInput, ReviewData } from "./review-types";
-import { normalizePath } from "./utils";
+import type { EditInput, ReviewData } from "./review-types.js";
+import { normalizePath } from "./utils.js";
 
 export function buildSteeringInstruction(
   toolName: "write" | "edit",

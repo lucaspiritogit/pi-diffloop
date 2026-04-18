@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, extname, join, resolve } from "node:path";
-import { normalizePath } from "./utils";
+import { normalizePath } from "./utils.js";
 
 export type ReviewScope = {
   includePatterns: string[];

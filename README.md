@@ -33,7 +33,7 @@ When working with coding agents, I kept running into two extremes:
 
 Both approaches can work, but they often come with the same problem: **context loss**.
 
-The agent may go further than expected, touch more files than intended, or make reasonable local decisions that drift away from what you had in mind. By the time it returns, you are no longer reviewing a small decision, you are reconstructing a chain of reasoning that its not your own.
+The agent may go further than expected, touch more files than intended, or make reasonable local decisions that drift away from what you had in mind. By the time it returns, you are no longer reviewing a small decision, you are reconstructing a chain of reasoning that is not your own.
 
 That is the problem diffloop is "meant" to solve.
 
@@ -62,7 +62,7 @@ When the agent proposes an `edit` or `write`:
 
 By default, diffloop reviews all `edit` and `write` proposals.
 
-You can scope review to specific files using `diffloop-config.json` in the extension folder.
+You can scope review to specific files using `diffloop-config.json` next to the installed package (same directory Pi resolves for the extension).
 
 Config shape:
 
@@ -98,22 +98,14 @@ It pushes the agent to provide reasons that are:
 ```text
 /diffloop off
 /diffloop on
+/diffloop toggle
 /diffloop status
 ```
 
-When enabled, the footer shows the current status.
-The on/off state is persisted in `diffloop-config.json`, so `/diffloop off` remains off for future sessions until you run `/diffloop on`.
-
 ## Development
 
-### Run tests
-
 ```bash
-bun test
-```
-
-### Type-check
-
-```bash
-bun run type-check
+npm install
+npm run build
+npm run typecheck
 ```
