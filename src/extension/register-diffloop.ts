@@ -6,22 +6,22 @@ import {
 import { Type } from "@sinclair/typebox";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { applyEditBlocksToContent } from "../diff-preview.js";
-import { appendDiffloopAudit } from "../diffloop-audit.js";
-import { loadDiffloopConfig, saveEnabledToConfig } from "../review-scope.js";
-import { handleReviewToolCall } from "../review-pipeline.js";
+import { appendDiffloopAudit } from "../audit/diffloop-audit.js";
+import { applyEditBlocksToContent } from "../diff/diff-preview.js";
 import { buildReviewData } from "../review/build-review-data.js";
 import { editProposal } from "../review/proposal-editor.js";
+import { handleReviewToolCall } from "../review/review-pipeline.js";
+import { loadDiffloopConfig, saveEnabledToConfig } from "../review/review-scope.js";
 import { buildReviewedApplyToolResultContent } from "../review/reviewed-apply-followup.js";
-import { createDiffloopRuntimeState } from "../runtime-state.js";
+import { createDiffloopRuntimeState } from "../review/runtime-state.js";
 import {
   normalizeReasonValue,
   normalizeReviewModeAction,
   normalizeToolCallInput,
   sanitizeToolCallInput,
 } from "../tools/edit-write-input.js";
-import { normalizePath } from "../utils.js";
-import { getCachedDiffloopUpdateVersion } from "../version-status.js";
+import { normalizePath } from "../lib/utils.js";
+import { getCachedDiffloopUpdateVersion } from "../lib/version-status.js";
 
 const DIFFLOOP_REVIEW_STATUS = "diffloop";
 const DIFFLOOP_REASON_TOOL_NAME = "set_change_reason";

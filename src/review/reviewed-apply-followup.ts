@@ -1,7 +1,7 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { normalizePath } from "../utils.js";
+import { normalizePath } from "../lib/utils.js";
 
 export const REVIEWED_APPLY_SNIPPET_MAX_CHARS = 48_000;
 

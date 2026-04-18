@@ -1,7 +1,7 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Input, Key, matchesKey } from "@mariozechner/pi-tui";
-import type { ReviewAction, ReviewData, ReviewDecision } from "../review-types.js";
-import { pushLine, pushWrappedLine } from "../utils.js";
+import type { ReviewAction, ReviewData, ReviewDecision } from "../review/review-types.js";
+import { pushLine, pushWrappedLine } from "../lib/utils.js";
 import { buildReviewBodyLines, type DiffViewMode } from "./review-diff-render.js";
 
 function countReviewDiffStats(review: ReviewData): { additions: number; removals: number } {

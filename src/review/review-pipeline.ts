@@ -1,7 +1,7 @@
 import { isToolCallEventType, type ExtensionContext, type ToolCallEvent, type ToolCallEventResult } from "@mariozechner/pi-coding-agent";
 import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
-import { handleReviewAction } from "./ui/review-screen.js";
+import { handleReviewAction } from "../ui/review-screen.js";
 import { isPathInReviewScope, loadDiffloopConfig } from "./review-scope.js";
 import type { EditInput, ReviewData, WriteInput } from "./review-types.js";
 import type { DiffloopRuntimeState } from "./runtime-state.js";
@@ -10,8 +10,8 @@ import {
   buildMissingTargetEditInstruction,
   buildSteeringInstruction,
   joinPathList,
-} from "./tool-hooks.js";
-import { normalizePath } from "./utils.js";
+} from "../tools/tool-hooks.js";
+import { normalizePath } from "../lib/utils.js";
 
 type BlockMeta = { code: string; toolName?: "write" | "edit"; path?: string };
 type BlockWithReason = (

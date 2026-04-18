@@ -10,10 +10,10 @@ import {
   getNativeEditBlockStatuses,
   runNativeEditPreview,
   runNativeWritePreview,
-} from "../diff-preview.js";
-import type { EditBlock, EditInput, NativeEditBlockStatus, ReviewData, WriteInput } from "../review-types.js";
-import { buildStructuredDiff } from "../structured-diff.js";
-import { normalizePath } from "../utils.js";
+} from "../diff/diff-preview.js";
+import type { EditBlock, EditInput, NativeEditBlockStatus, ReviewData, WriteInput } from "./review-types.js";
+import { buildStructuredDiff } from "../diff/structured-diff.js";
+import { normalizePath } from "../lib/utils.js";
 import { normalizeEditInput } from "../tools/edit-write-input.js";
 
 export async function buildReviewData(

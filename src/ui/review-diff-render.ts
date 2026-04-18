@@ -1,9 +1,9 @@
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
-import type { DiffPreviewLine, ReviewData } from "../review-types.js";
-import type { InlineRange, StructuredDiff, StructuredDiffRow } from "../structured-diff.js";
-import { detectSyntaxLanguage, getSyntaxTokenColorAnsi, tokenizeSyntaxLine, type SyntaxSegment } from "../syntax-highlight.js";
-import { pushWrappedLine } from "../utils.js";
+import type { DiffPreviewLine, ReviewData } from "../review/review-types.js";
+import type { InlineRange, StructuredDiff, StructuredDiffRow } from "../diff/structured-diff.js";
+import { detectSyntaxLanguage, getSyntaxTokenColorAnsi, tokenizeSyntaxLine, type SyntaxSegment } from "../diff/syntax-highlight.js";
+import { pushWrappedLine } from "../lib/utils.js";
 
 const TAB_REPLACEMENT = "    ";
 

@@ -3,10 +3,10 @@ import { spawnSync } from "node:child_process";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { extname, join, resolve } from "node:path";
-import { getNativeEditBlockStatuses } from "../diff-preview.js";
-import type { EditBlock, EditInput, NativeEditBlockStatus, WriteInput } from "../review-types.js";
+import { getNativeEditBlockStatuses } from "../diff/diff-preview.js";
+import type { EditBlock, EditInput, NativeEditBlockStatus, WriteInput } from "./review-types.js";
 import { normalizeEditInput } from "../tools/edit-write-input.js";
-import { normalizePath } from "../utils.js";
+import { normalizePath } from "../lib/utils.js";
 
 type ExternalEditorResult = {
   exitCode: number;

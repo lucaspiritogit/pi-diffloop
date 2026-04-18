@@ -1,5 +1,5 @@
-import type { EditBlock, EditInput, WriteInput } from "../review-types.js";
-import { normalizePath } from "../utils.js";
+import type { EditBlock, EditInput, WriteInput } from "../review/review-types.js";
+import { normalizePath } from "../lib/utils.js";
 
 export function normalizeEditArguments(args: any) {
   if (!args || typeof args !== "object") return args;

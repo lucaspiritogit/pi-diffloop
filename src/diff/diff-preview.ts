@@ -1,7 +1,7 @@
 import { createEditToolDefinition, createWriteToolDefinition } from "@mariozechner/pi-coding-agent";
 import { constants } from "node:fs";
 import { access, readFile } from "node:fs/promises";
-import type { DiffPreviewLine, EditBlock, NativeEditBlockStatus, NativeEditPreviewResult } from "./review-types.js";
+import type { DiffPreviewLine, EditBlock, NativeEditBlockStatus, NativeEditPreviewResult } from "../review/review-types.js";
 
 type NativeWritePreviewResult = { ok: true } | { ok: false; error: string };
 
