@@ -1,4 +1,6 @@
 import { isToolCallEventType, type ExtensionContext, type ToolCallEvent, type ToolCallEventResult } from "@mariozechner/pi-coding-agent";
+import { readFile } from "node:fs/promises";
+import { resolve } from "node:path";
 import { handleReviewAction } from "./ui/review-screen.js";
 import { isPathInReviewScope, loadDiffloopConfig } from "./review-scope.js";
 import type { EditInput, ReviewData, WriteInput } from "./review-types.js";
@@ -201,6 +203,18 @@ export async function handleReviewToolCall(
       if (toolName === "write" && pendingEditedWriteInput) {
         deps.sanitizeToolCallInput(event, toolName, pendingEditedWriteInput);
         deps.state.queuePendingWriteOverride(event.toolCallId, pendingEditedWriteInput.path, pendingEditedWriteInput.content);
+      }
+      if (toolName === "edit" && proposalEditedInReview) {
+        const editInput = proposedInput as EditInput;
+        const normalizedEditPath = normalizePath(editInput.path);
+        if (normalizedEditPath) {
+          try {
+            const baseSnapshot = await readFile(resolve(ctx.cwd, normalizedEditPath), "utf8");
+            deps.state.queuePendingEditOverride(event.toolCallId, editInput.path, editInput.edits, baseSnapshot);
+          } catch {
+            ctx.ui.notify(`Could not read ${normalizedEditPath} before applying reviewed edit; override skipped.`, "warning");
+          }
+        }
       }
       if (proposalEditedInReview) {
         const approvedPath = normalizePath(

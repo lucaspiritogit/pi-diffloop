@@ -6,7 +6,8 @@ import {
 import { Type } from "@sinclair/typebox";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { appendDiffloopAudit, readDiffloopAuditStats } from "../diffloop-audit.js";
+import { applyEditBlocksToContent } from "../diff-preview.js";
+import { appendDiffloopAudit } from "../diffloop-audit.js";
 import { loadDiffloopConfig, saveEnabledToConfig } from "../review-scope.js";
 import { handleReviewToolCall } from "../review-pipeline.js";
 import { buildReviewData } from "../review/build-review-data.js";
@@ -30,7 +31,6 @@ const DIFFLOOP_REASON_GUIDANCE =
 export default function registerDiffloopExtension(pi: ExtensionAPI) {
   const state = createDiffloopRuntimeState(loadDiffloopConfig());
   let availableUpdateVersion: string | undefined;
-  let auditStatsSuffix = "";
 
   const sendSteeringFeedback = (message: string): boolean => {
     try {
@@ -39,23 +39,6 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
     } catch {
       return false;
     }
-  };
-
-  const refreshAuditStatus = (ctx: ExtensionContext) => {
-    if (!ctx.hasUI) {
-      auditStatsSuffix = "";
-      return;
-    }
-    if (typeof (ctx as any).sessionManager?.getBranch !== "function") {
-      auditStatsSuffix = "";
-      return;
-    }
-    const stats = readDiffloopAuditStats(ctx);
-    if (stats.decisions === 0 && stats.blocked === 0 && stats.recoveries === 0) {
-      auditStatsSuffix = "";
-      return;
-    }
-    auditStatsSuffix = ` ${ctx.ui.theme.fg("dim", `d${stats.decisions} b${stats.blocked} r${stats.recoveries}`)}`;
   };
 
   const blockWithReason = (
@@ -109,7 +92,7 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
 
       if (action === "invalid") {
         ctx.ui.notify("Usage: /diffloop [on|off|toggle|status]", "error");
-        displayDiffloopStatus(ctx, enabled, false, availableUpdateVersion, auditStatsSuffix);
+        displayDiffloopStatus(ctx, enabled, false, availableUpdateVersion);
         return;
       }
 
@@ -137,8 +120,7 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
       }
 
       syncReasonToolActivation();
-      refreshAuditStatus(ctx);
-      displayDiffloopStatus(ctx, nextEnabled, true, availableUpdateVersion, auditStatsSuffix);
+      displayDiffloopStatus(ctx, nextEnabled, true, availableUpdateVersion);
     },
   });
 
@@ -173,21 +155,19 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
     state.refreshConfig(loadDiffloopConfig());
     state.resetForSessionBoundary();
     syncReasonToolActivation();
-    refreshAuditStatus(ctx);
-    displayDiffloopStatus(ctx, state.getEnabled(), false, availableUpdateVersion, auditStatsSuffix);
+    displayDiffloopStatus(ctx, state.getEnabled(), false, availableUpdateVersion);
 
     void (async () => {
       availableUpdateVersion = await getCachedDiffloopUpdateVersion();
       if (availableUpdateVersion) {
-        displayDiffloopStatus(ctx, state.getEnabled(), false, availableUpdateVersion, auditStatsSuffix);
+        displayDiffloopStatus(ctx, state.getEnabled(), false, availableUpdateVersion);
       }
     })();
   });
 
   pi.on("session_tree", async (_event, ctx) => {
     state.resetForSessionBoundary();
-    refreshAuditStatus(ctx);
-    displayDiffloopStatus(ctx, state.getEnabled(), false, availableUpdateVersion, auditStatsSuffix);
+    displayDiffloopStatus(ctx, state.getEnabled(), false, availableUpdateVersion);
   });
 
   pi.on("session_shutdown", async () => {
@@ -277,6 +257,50 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
       }
     }
 
+    if (event.toolName === "edit") {
+      const pendingEditOverride = state.consumePendingEditOverride(event.toolCallId, inputPath);
+      if (pendingEditOverride && !event.isError) {
+        const normalizedOverridePath = normalizePath(pendingEditOverride.path || inputPath || "");
+        const absolutePath = resolve(ctx.cwd, normalizedOverridePath);
+        const applied = applyEditBlocksToContent(pendingEditOverride.baseSnapshot, pendingEditOverride.edits);
+        if (!applied.ok) {
+          const message = applied.error;
+          if (ctx.hasUI) {
+            ctx.ui.notify(`Failed to apply reviewed edit override for ${normalizedOverridePath}: ${message}`, "warning");
+          }
+          return {
+            content: [
+              ...event.content,
+              {
+                type: "text" as const,
+                text: `Diffloop warning: failed to apply reviewed edit override for ${normalizedOverridePath}: ${message}`,
+              },
+            ],
+            details: event.details,
+          };
+        }
+        try {
+          await mkdir(dirname(absolutePath), { recursive: true });
+          await writeFile(absolutePath, applied.afterText, "utf8");
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (ctx.hasUI) {
+            ctx.ui.notify(`Failed to write reviewed edit override for ${normalizedOverridePath}: ${message}`, "warning");
+          }
+          return {
+            content: [
+              ...event.content,
+              {
+                type: "text" as const,
+                text: `Diffloop warning: failed to write reviewed edit override for ${normalizedOverridePath}: ${message}`,
+              },
+            ],
+            details: event.details,
+          };
+        }
+      }
+    }
+
     const isEditOrWriteError = (event.toolName === "edit" || event.toolName === "write") && event.isError;
     if (isEditOrWriteError) {
       const failedPath = typeof event.input?.path === "string" ? normalizePath(event.input.path) : "";
@@ -325,7 +349,6 @@ function displayDiffloopStatus(
   enabled: boolean,
   announce = false,
   availableUpdateVersion?: string,
-  auditStatsSuffix = "",
 ) {
   if (!ctx.hasUI) return;
 
@@ -334,7 +357,7 @@ function displayDiffloopStatus(
     ? ctx.ui.theme.fg("accent", ` update v${availableUpdateVersion} available`)
     : "";
 
-  ctx.ui.setStatus(DIFFLOOP_REVIEW_STATUS, `${baseStatusText}${updateStatusText}${auditStatsSuffix}`);
+  ctx.ui.setStatus(DIFFLOOP_REVIEW_STATUS, `${baseStatusText}${updateStatusText}`);
   if (announce) {
     ctx.ui.notify(`Diffloop ${enabled ? "on" : "off"}`, enabled ? "warning" : "info");
   }

@@ -1,10 +1,18 @@
 import { resolve } from "node:path";
 import { loadDiffloopConfig, type DiffloopConfig } from "./review-scope.js";
+import type { EditBlock } from "./review-types.js";
 import { normalizePath } from "./utils.js";
 
 type PendingWriteOverride = {
   path: string;
   content: string;
+  toolCallId?: string;
+};
+
+type PendingEditOverride = {
+  path: string;
+  edits: EditBlock[];
+  baseSnapshot: string;
   toolCallId?: string;
 };
 
@@ -27,6 +35,8 @@ export function createDiffloopRuntimeState(initialConfig: DiffloopConfig = loadD
   let denyHold = false;
   const pendingWriteOverridesByCallId = new Map<string, PendingWriteOverride>();
   const pendingWriteOverridesByPath = new Map<string, PendingWriteOverride[]>();
+  const pendingEditOverridesByCallId = new Map<string, PendingEditOverride>();
+  const pendingEditOverridesByPath = new Map<string, PendingEditOverride[]>();
   const pendingReviewedMutationsByCallId = new Map<string, PendingReviewedMutation>();
   const pendingReviewedMutationsByToolPath = new Map<string, PendingReviewedMutation[]>();
 
@@ -90,6 +100,21 @@ export function createDiffloopRuntimeState(initialConfig: DiffloopConfig = loadD
     return matchedRequiredPaths;
   };
 
+  const removePendingEditOverrideFromPathQueue = (pending: PendingEditOverride) => {
+    const queue = pendingEditOverridesByPath.get(pending.path);
+    if (!queue) return;
+    const index = queue.findIndex((item) => item === pending);
+    if (index >= 0) queue.splice(index, 1);
+    if (queue.length === 0) {
+      pendingEditOverridesByPath.delete(pending.path);
+    }
+  };
+
+  const clearPendingEditOverrides = () => {
+    pendingEditOverridesByCallId.clear();
+    pendingEditOverridesByPath.clear();
+  };
+
   const removePendingWriteOverrideFromPathQueue = (pending: PendingWriteOverride) => {
     const queue = pendingWriteOverridesByPath.get(pending.path);
     if (!queue) return;
@@ -103,6 +128,48 @@ export function createDiffloopRuntimeState(initialConfig: DiffloopConfig = loadD
   const clearPendingWriteOverrides = () => {
     pendingWriteOverridesByCallId.clear();
     pendingWriteOverridesByPath.clear();
+  };
+
+  const queuePendingEditOverride = (
+    toolCallId: string | undefined,
+    path: string,
+    edits: EditBlock[],
+    baseSnapshot: string,
+  ) => {
+    const normalizedPath = normalizePath(path);
+    const pending: PendingEditOverride = { path: normalizedPath, edits, baseSnapshot, toolCallId };
+    const queue = pendingEditOverridesByPath.get(normalizedPath) ?? [];
+    queue.push(pending);
+    pendingEditOverridesByPath.set(normalizedPath, queue);
+    if (toolCallId) {
+      pendingEditOverridesByCallId.set(toolCallId, pending);
+    }
+  };
+
+  const consumePendingEditOverride = (toolCallId: string | undefined, inputPath: string | undefined) => {
+    if (toolCallId) {
+      const pendingById = pendingEditOverridesByCallId.get(toolCallId);
+      if (pendingById) {
+        pendingEditOverridesByCallId.delete(toolCallId);
+        removePendingEditOverrideFromPathQueue(pendingById);
+        return pendingById;
+      }
+    }
+
+    if (!inputPath) return undefined;
+
+    const normalizedPath = normalizePath(inputPath);
+    const queue = pendingEditOverridesByPath.get(normalizedPath);
+    if (!queue || queue.length === 0) return undefined;
+    const pendingByPath = queue.shift();
+    if (!pendingByPath) return undefined;
+    if (queue.length === 0) {
+      pendingEditOverridesByPath.delete(normalizedPath);
+    }
+    if (pendingByPath.toolCallId) {
+      pendingEditOverridesByCallId.delete(pendingByPath.toolCallId);
+    }
+    return pendingByPath;
   };
 
   const buildReviewedMutationKey = (toolName: "write" | "edit", path: string) => `${toolName}:${normalizePath(path)}`;
@@ -215,6 +282,7 @@ export function createDiffloopRuntimeState(initialConfig: DiffloopConfig = loadD
     clearReadRequirements();
     clearPendingChangeReasons();
     clearPendingWriteOverrides();
+    clearPendingEditOverrides();
     clearPendingReviewedMutations();
     denyHold = false;
   };
@@ -240,8 +308,11 @@ export function createDiffloopRuntimeState(initialConfig: DiffloopConfig = loadD
     listPendingReadPathsForPath,
     matchAndConsumeReadPath,
     clearPendingWriteOverrides,
+    clearPendingEditOverrides,
     queuePendingWriteOverride,
     consumePendingWriteOverride,
+    queuePendingEditOverride,
+    consumePendingEditOverride,
     queuePendingReviewedMutation,
     consumePendingReviewedMutation,
     resetForSessionBoundary,
