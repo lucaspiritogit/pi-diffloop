@@ -6,7 +6,6 @@ import {
 import { Type } from "@sinclair/typebox";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { appendDiffloopAudit } from "../audit/diffloop-audit.js";
 import { applyEditBlocksToContent } from "../diff/diff-preview.js";
 import { buildReviewData } from "../review/build-review-data.js";
 import { editProposal } from "../review/proposal-editor.js";
@@ -41,28 +40,8 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
     }
   };
 
-  const blockWithReason = (
-    reason: string,
-    _key?: string,
-    meta?: { code: string; toolName?: "write" | "edit"; path?: string },
-  ) => {
-    const blocked = state.buildBlockedResult(reason);
-    if (blocked.reason) {
-      const auditReason =
-        meta?.code && meta?.path
-          ? `${meta.code}: ${normalizePath(meta.path)}`
-          : meta?.code && blocked.reason.length > 400
-            ? meta.code
-            : blocked.reason;
-      appendDiffloopAudit(pi, {
-        kind: "blocked",
-        code: meta?.code ?? "blocked",
-        toolName: meta?.toolName,
-        path: meta?.path,
-        reason: auditReason,
-      });
-    }
-    return blocked;
+  const blockWithReason = (reason: string, _key?: string, _meta?: { code: string; toolName?: "write" | "edit"; path?: string }) => {
+    return state.buildBlockedResult(reason);
   };
 
   const syncReasonToolActivation = () => {
@@ -106,7 +85,6 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
       if (action !== "status") {
         try {
           saveEnabledToConfig(nextEnabled);
-          appendDiffloopAudit(pi, { kind: "toggle", enabled: nextEnabled });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           ctx.ui.notify(`Failed to persist diffloop state: ${message}`, "warning");
@@ -200,20 +178,7 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
       editProposal,
       sendSteeringFeedback,
       blockWithReason,
-      onDecision: (decision: {
-        action: "approve" | "deny" | "steer" | "edit";
-        toolName: "write" | "edit";
-        path: string;
-        reason?: string;
-      }) => {
-        appendDiffloopAudit(pi, {
-          kind: "decision",
-          action: decision.action,
-          toolName: decision.toolName,
-          path: decision.path,
-          reason: decision.reason,
-        });
-      },
+      onDecision: () => {},
       onDenyAbort: (pipelineCtx: ExtensionContext) => {
         pipelineCtx.abort();
       },
@@ -307,12 +272,6 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
       if (!failedPath) return undefined;
 
       state.setPendingReadRequirements(failedPath);
-      appendDiffloopAudit(pi, {
-        kind: "recovery",
-        toolName: event.toolName === "edit" ? "edit" : "write",
-        path: failedPath,
-        isError: true,
-      });
 
       if (ctx.hasUI) {
         ctx.ui.notify(
