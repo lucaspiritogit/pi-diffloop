@@ -2,7 +2,7 @@ import {
   isWriteToolResult,
   type ExtensionAPI,
   type ExtensionContext,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -20,7 +20,6 @@ import {
   sanitizeToolCallInput,
 } from "../tools/edit-write-input.js";
 import { normalizePath } from "../lib/utils.js";
-import { getCachedDiffloopUpdateVersion } from "../lib/version-status.js";
 
 const DIFFLOOP_REVIEW_STATUS = "diffloop";
 const DIFFLOOP_REASON_TOOL_NAME = "set_change_reason";
@@ -29,7 +28,6 @@ const DIFFLOOP_REASON_GUIDANCE =
 
 export default function registerDiffloopExtension(pi: ExtensionAPI) {
   const state = createDiffloopRuntimeState(loadDiffloopConfig());
-  let availableUpdateVersion: string | undefined;
 
   const sendSteeringFeedback = (message: string): boolean => {
     try {
@@ -71,7 +69,7 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
 
       if (action === "invalid") {
         ctx.ui.notify("Usage: /diffloop [on|off|toggle|status]", "error");
-        displayDiffloopStatus(ctx, enabled, false, availableUpdateVersion);
+        displayDiffloopStatus(ctx, enabled, false);
         return;
       }
 
@@ -98,7 +96,7 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
       }
 
       syncReasonToolActivation();
-      displayDiffloopStatus(ctx, nextEnabled, true, availableUpdateVersion);
+      displayDiffloopStatus(ctx, nextEnabled, true);
     },
   });
 
@@ -133,19 +131,12 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
     state.refreshConfig(loadDiffloopConfig());
     state.resetForSessionBoundary();
     syncReasonToolActivation();
-    displayDiffloopStatus(ctx, state.getEnabled(), false, availableUpdateVersion);
-
-    void (async () => {
-      availableUpdateVersion = await getCachedDiffloopUpdateVersion();
-      if (availableUpdateVersion) {
-        displayDiffloopStatus(ctx, state.getEnabled(), false, availableUpdateVersion);
-      }
-    })();
+    displayDiffloopStatus(ctx, state.getEnabled(), false);
   });
 
   pi.on("session_tree", async (_event, ctx) => {
     state.resetForSessionBoundary();
-    displayDiffloopStatus(ctx, state.getEnabled(), false, availableUpdateVersion);
+    displayDiffloopStatus(ctx, state.getEnabled(), false);
   });
 
   pi.on("session_shutdown", async () => {
@@ -307,16 +298,12 @@ function displayDiffloopStatus(
   ctx: ExtensionContext,
   enabled: boolean,
   announce = false,
-  availableUpdateVersion?: string,
 ) {
   if (!ctx.hasUI) return;
 
   const baseStatusText = enabled ? ctx.ui.theme.fg("warning", "diffloop on") : ctx.ui.theme.fg("dim", "diffloop off");
-  const updateStatusText = availableUpdateVersion
-    ? ctx.ui.theme.fg("accent", ` update v${availableUpdateVersion} available`)
-    : "";
 
-  ctx.ui.setStatus(DIFFLOOP_REVIEW_STATUS, `${baseStatusText}${updateStatusText}`);
+  ctx.ui.setStatus(DIFFLOOP_REVIEW_STATUS, baseStatusText);
   if (announce) {
     ctx.ui.notify(`Diffloop ${enabled ? "on" : "off"}`, enabled ? "warning" : "info");
   }

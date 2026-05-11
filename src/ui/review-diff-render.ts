@@ -1,5 +1,5 @@
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { DiffPreviewLine, ReviewData } from "../review/review-types.js";
 import type { InlineRange, StructuredDiff, StructuredDiffRow } from "../diff/structured-diff.js";
 import { detectSyntaxLanguage, getSyntaxTokenColorAnsi, tokenizeSyntaxLine, type SyntaxSegment } from "../diff/syntax-highlight.js";

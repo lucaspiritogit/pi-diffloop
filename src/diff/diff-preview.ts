@@ -1,4 +1,4 @@
-import { createEditToolDefinition, createWriteToolDefinition } from "@mariozechner/pi-coding-agent";
+import { createEditToolDefinition, createWriteToolDefinition } from "@earendil-works/pi-coding-agent";
 import { constants } from "node:fs";
 import { access, readFile } from "node:fs/promises";
 import type { DiffPreviewLine, EditBlock, NativeEditBlockStatus, NativeEditPreviewResult } from "../review/review-types.js";

@@ -1,4 +1,4 @@
-import type { EditToolInput, WriteToolInput } from "@mariozechner/pi-coding-agent";
+import type { EditToolInput, WriteToolInput } from "@earendil-works/pi-coding-agent";
 import type { StructuredDiff } from "../diff/structured-diff.js";
 
 export type DiffPreviewLineKind = "meta" | "context" | "add" | "remove" | "warning";
