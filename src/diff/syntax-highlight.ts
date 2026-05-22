@@ -1,6 +1,11 @@
 import * as path from "node:path";
 
-import { highlight, supportsLanguage, type Theme as HighlightTheme } from "cli-highlight";
+import {
+  highlight,
+  supportsLanguage,
+  type Theme as HighlightTheme,
+} from "cli-highlight";
+import { createLruCache } from "../lib/lru-cache.js";
 
 export type SyntaxTokenKind = Exclude<keyof HighlightTheme, "default">;
 
@@ -64,7 +69,8 @@ const MARKER_THEME: HighlightTheme = {
 };
 
 for (const token of TOKEN_KINDS) {
-  MARKER_THEME[token] = (codePart: string) => `${TOKEN_START}${token}${TOKEN_SEPARATOR}${codePart}${TOKEN_END}`;
+  MARKER_THEME[token] = (codePart: string) =>
+    `${TOKEN_START}${token}${TOKEN_SEPARATOR}${codePart}${TOKEN_END}`;
 }
 
 const BASENAME_LANGUAGE_MAP = new Map<string, string>([
@@ -157,7 +163,11 @@ const TOKEN_COLOR_ANSI: Partial<Record<SyntaxTokenKind, string>> = {
   deletion: fg256(229),
 };
 
-function pushSegment(segments: SyntaxSegment[], text: string, token?: SyntaxTokenKind): void {
+function pushSegment(
+  segments: SyntaxSegment[],
+  text: string,
+  token?: SyntaxTokenKind,
+): void {
   if (text.length === 0) return;
   const last = segments[segments.length - 1];
   if (last && last.token === token) {
@@ -185,19 +195,34 @@ function parseMarkedSegments(markedText: string): SyntaxSegment[] {
     const markerIndex = isStart ? nextStart : nextEnd;
 
     if (markerIndex > cursor) {
-      pushSegment(segments, markedText.slice(cursor, markerIndex), stack[stack.length - 1]);
+      pushSegment(
+        segments,
+        markedText.slice(cursor, markerIndex),
+        stack[stack.length - 1],
+      );
     }
 
     if (isStart) {
-      const separatorIndex = markedText.indexOf(TOKEN_SEPARATOR, markerIndex + 1);
+      const separatorIndex = markedText.indexOf(
+        TOKEN_SEPARATOR,
+        markerIndex + 1,
+      );
       if (separatorIndex === -1) {
-        pushSegment(segments, markedText.slice(markerIndex), stack[stack.length - 1]);
+        pushSegment(
+          segments,
+          markedText.slice(markerIndex),
+          stack[stack.length - 1],
+        );
         break;
       }
 
       const token = markedText.slice(markerIndex + 1, separatorIndex);
       if (!TOKEN_KIND_SET.has(token as SyntaxTokenKind)) {
-        pushSegment(segments, markedText.slice(markerIndex, separatorIndex + 1), stack[stack.length - 1]);
+        pushSegment(
+          segments,
+          markedText.slice(markerIndex, separatorIndex + 1),
+          stack[stack.length - 1],
+        );
         cursor = separatorIndex + 1;
         continue;
       }
@@ -223,12 +248,29 @@ export function detectSyntaxLanguage(filePath: string): string | undefined {
   const extension = path.extname(baseName);
   if (!extension) return undefined;
 
-  const mappedExtension = EXTENSION_LANGUAGE_MAP[extension] ?? extension.slice(1);
+  const mappedExtension =
+    EXTENSION_LANGUAGE_MAP[extension] ?? extension.slice(1);
   return supportsLanguage(mappedExtension) ? mappedExtension : undefined;
 }
 
-export function tokenizeSyntaxLine(text: string, language: string | undefined): SyntaxSegment[] {
+// Token cache — avoids re-highlighting identical lines across frames.
+// Cleared on session_shutdown.
+const MAX_TOKEN_CACHE_SIZE = 5000;
+const tokenCache = createLruCache<SyntaxSegment[]>(MAX_TOKEN_CACHE_SIZE);
+
+// \x00 cannot appear in source text, so keys stay unambiguous.
+const KEY_SEP = "\x00";
+
+export function tokenizeSyntaxLine(
+  text: string,
+  language: string | undefined,
+): SyntaxSegment[] {
   if (!language || text.length === 0) return [{ text }];
+
+  const cacheKey = `${text}${KEY_SEP}${language}`;
+
+  const cached = tokenCache.get(cacheKey);
+  if (cached !== undefined) return cached;
 
   try {
     const marked = highlight(text, {
@@ -237,13 +279,24 @@ export function tokenizeSyntaxLine(text: string, language: string | undefined): 
       theme: MARKER_THEME,
     });
     const segments = parseMarkedSegments(marked);
-    return segments.length > 0 ? segments : [{ text }];
+    const result = segments.length > 0 ? segments : [{ text }];
+
+    tokenCache.set(cacheKey, result);
+    return result;
   } catch {
-    return [{ text }];
+    const fallback = [{ text }];
+    tokenCache.set(cacheKey, fallback);
+    return fallback;
   }
 }
 
-export function getSyntaxTokenColorAnsi(token: SyntaxTokenKind | undefined): string | undefined {
+export function clearSyntaxTokenCache(): void {
+  tokenCache.clear();
+}
+
+export function getSyntaxTokenColorAnsi(
+  token: SyntaxTokenKind | undefined,
+): string | undefined {
   if (!token) return undefined;
   return TOKEN_COLOR_ANSI[token];
 }
