@@ -18,12 +18,14 @@ type ReviewScopeConfigShape = Partial<{
 
 type DiffloopConfigShape = Partial<{
   enabled: unknown;
+  requireReason: unknown;
   reviewScope: ReviewScopeConfigShape;
 }> &
   ReviewScopeConfigShape;
 
 export type DiffloopConfig = {
   enabled: boolean;
+  requireReason: boolean;
   reviewScope: ReviewScope;
 };
 
@@ -140,17 +142,25 @@ function parseEnabled(rawConfig: unknown): boolean {
   return typeof enabledValue === "boolean" ? enabledValue : true;
 }
 
+function parseRequireReason(rawConfig: unknown): boolean {
+  if (!rawConfig || typeof rawConfig !== "object") return true;
+  const requireReasonValue = (rawConfig as DiffloopConfigShape).requireReason;
+  return typeof requireReasonValue === "boolean" ? requireReasonValue : true;
+}
+
 export function loadDiffloopConfig(configPath = resolveDiffloopConfigPath()): DiffloopConfig {
   try {
     const raw = readFileSync(configPath, "utf8");
     const parsed = JSON.parse(raw);
     return {
       enabled: parseEnabled(parsed),
+      requireReason: parseRequireReason(parsed),
       reviewScope: parseReviewScopeConfig(parsed),
     };
   } catch {
     return {
       enabled: true,
+      requireReason: true,
       reviewScope: parseReviewScopeConfig({}),
     };
   }
@@ -169,6 +179,22 @@ export function saveEnabledToConfig(enabled: boolean, configPath = resolveDifflo
   }
 
   base.enabled = enabled;
+  writeFileSync(configPath, `${JSON.stringify(base, null, 2)}\n`, "utf8");
+}
+
+export function saveRequireReasonToConfig(requireReason: boolean, configPath = resolveDiffloopConfigPath()): void {
+  let base: Record<string, unknown> = {};
+
+  try {
+    const raw = readFileSync(configPath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      base = { ...(parsed as Record<string, unknown>) };
+    }
+  } catch {
+  }
+
+  base.requireReason = requireReason;
   writeFileSync(configPath, `${JSON.stringify(base, null, 2)}\n`, "utf8");
 }
 

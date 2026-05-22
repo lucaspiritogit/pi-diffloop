@@ -22,7 +22,7 @@ export async function buildReviewData(
   input: WriteInput | EditInput,
 ): Promise<ReviewData> {
   const path = normalizePath(input.path);
-  const reason = input.reason.trim() || "(no reason provided)";
+  const reason = input.reason.trim();
   const absolutePath = resolve(ctx.cwd, path);
   let existingContent: string | undefined;
   try {

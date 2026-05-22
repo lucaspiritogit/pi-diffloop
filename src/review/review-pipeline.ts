@@ -76,11 +76,14 @@ export async function handleReviewToolCall(
   if (isReasonToolCall) {
     const reason = deps.normalizeReasonValue((event.input as { reason?: unknown } | undefined)?.reason);
     if (!reason) {
-      return deps.blockWithReason(
-        `Blocked ${deps.reasonToolName}: include a non-empty reason and retry.`,
-        `${deps.reasonToolName}:empty`,
-        { code: "reason-tool-empty" },
-      );
+      if (deps.state.getRequireReason()) {
+        return deps.blockWithReason(
+          `Blocked ${deps.reasonToolName}: include a non-empty reason and retry.`,
+          `${deps.reasonToolName}:empty`,
+          { code: "reason-tool-empty" },
+        );
+      }
+      return undefined;
     }
 
     deps.state.queuePendingChangeReason(reason);
@@ -163,7 +166,7 @@ export async function handleReviewToolCall(
       resolvedChangeReason = deps.normalizeReasonValue(proposedInput.reason) || deps.state.consumePendingChangeReason();
     }
     proposedInput.reason = resolvedChangeReason ?? "";
-    if (!proposedInput.reason) {
+    if (!proposedInput.reason && deps.state.getRequireReason()) {
       return deps.blockWithReason(
         `Blocked ${toolName}: call ${deps.reasonToolName} first with a concrete reason, then retry one ${toolName} proposal.`,
         `${toolName}:missing-reason`,

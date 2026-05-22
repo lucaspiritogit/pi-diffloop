@@ -10,7 +10,7 @@ import { applyEditBlocksToContent } from "../diff/diff-preview.js";
 import { buildReviewData } from "../review/build-review-data.js";
 import { editProposal } from "../review/proposal-editor.js";
 import { handleReviewToolCall } from "../review/review-pipeline.js";
-import { loadDiffloopConfig, saveEnabledToConfig } from "../review/review-scope.js";
+import { loadDiffloopConfig, saveEnabledToConfig, saveRequireReasonToConfig } from "../review/review-scope.js";
 import { buildReviewedApplyToolResultContent } from "../review/reviewed-apply-followup.js";
 import { createDiffloopRuntimeState } from "../review/runtime-state.js";
 import {
@@ -49,7 +49,7 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
     const activeTools = api.getActiveTools();
     const withoutReasonTool = activeTools.filter((toolName) => toolName !== DIFFLOOP_REASON_TOOL_NAME);
 
-    if (state.getEnabled()) {
+    if (state.getEnabled() && state.getRequireReason()) {
       if (!activeTools.includes(DIFFLOOP_REASON_TOOL_NAME)) {
         api.setActiveTools([...withoutReasonTool, DIFFLOOP_REASON_TOOL_NAME]);
       }
@@ -69,7 +69,7 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
 
       if (action === "invalid") {
         ctx.ui.notify("Usage: /diffloop [on|off|toggle|status]", "error");
-        displayDiffloopStatus(ctx, enabled, false);
+        displayDiffloopStatus(ctx, enabled, state.getRequireReason(), false);
         return;
       }
 
@@ -96,7 +96,48 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
       }
 
       syncReasonToolActivation();
-      displayDiffloopStatus(ctx, nextEnabled, true);
+      displayDiffloopStatus(ctx, state.getEnabled(), state.getRequireReason(), true);
+    },
+  });
+
+  pi.registerCommand("diffloop-reason", {
+    description: "Set required change reasons on, off, toggle, or show status",
+    handler: async (args, ctx) => {
+      const action = normalizeReviewModeAction(args);
+      const requireReason = state.getRequireReason();
+
+      if (action === "invalid") {
+        ctx.ui.notify("Usage: /diffloop-reason [on|off|toggle|status]", "error");
+        displayDiffloopStatus(ctx, state.getEnabled(), requireReason, false);
+        return;
+      }
+
+      let nextRequireReason = requireReason;
+      if (action === "toggle") nextRequireReason = !requireReason;
+      if (action === "on") nextRequireReason = true;
+      if (action === "off") nextRequireReason = false;
+      state.setRequireReason(nextRequireReason);
+
+      if (action !== "status") {
+        try {
+          saveRequireReasonToConfig(nextRequireReason);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          ctx.ui.notify(`Failed to persist diffloop reason state: ${message}`, "warning");
+        }
+        if (!nextRequireReason) {
+          state.clearPendingChangeReasons();
+        }
+        syncReasonToolActivation();
+      }
+
+      displayDiffloopStatus(ctx, state.getEnabled(), nextRequireReason, false);
+      if (action !== "status" && ctx.hasUI) {
+        ctx.ui.notify(
+          nextRequireReason ? "Change reasons required" : "Change reasons optional",
+          nextRequireReason ? "warning" : "info",
+        );
+      }
     },
   });
 
@@ -120,7 +161,7 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (event) => {
-    if (!state.getEnabled()) return undefined;
+    if (!state.getEnabled() || !state.getRequireReason()) return undefined;
 
     return {
       systemPrompt: `${event.systemPrompt}\n\n${DIFFLOOP_REASON_GUIDANCE}`,
@@ -131,12 +172,12 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
     state.refreshConfig(loadDiffloopConfig());
     state.resetForSessionBoundary();
     syncReasonToolActivation();
-    displayDiffloopStatus(ctx, state.getEnabled(), false);
+    displayDiffloopStatus(ctx, state.getEnabled(), state.getRequireReason(), false);
   });
 
   pi.on("session_tree", async (_event, ctx) => {
     state.resetForSessionBoundary();
-    displayDiffloopStatus(ctx, state.getEnabled(), false);
+    displayDiffloopStatus(ctx, state.getEnabled(), state.getRequireReason(), false);
   });
 
   pi.on("session_shutdown", async () => {
@@ -297,14 +338,24 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
 function displayDiffloopStatus(
   ctx: ExtensionContext,
   enabled: boolean,
+  requireReason: boolean,
   announce = false,
 ) {
   if (!ctx.hasUI) return;
 
-  const baseStatusText = enabled ? ctx.ui.theme.fg("warning", "diffloop on") : ctx.ui.theme.fg("dim", "diffloop off");
+  const reviewStatus = enabled ? ctx.ui.theme.fg("warning", "diffloop on") : ctx.ui.theme.fg("dim", "diffloop off");
+  const reasonStatus = requireReason
+    ? ctx.ui.theme.fg("accent", "review reason on")
+    : ctx.ui.theme.fg("dim", "review reason off");
+  const baseStatusText = enabled ? `${reviewStatus} • ${reasonStatus}` : reviewStatus;
 
   ctx.ui.setStatus(DIFFLOOP_REVIEW_STATUS, baseStatusText);
   if (announce) {
-    ctx.ui.notify(`Diffloop ${enabled ? "on" : "off"}`, enabled ? "warning" : "info");
+    const message = !enabled
+      ? "Diffloop off"
+      : requireReason
+        ? "Diffloop on"
+        : "Diffloop reasons optional";
+    ctx.ui.notify(message, enabled ? "warning" : "info");
   }
 }

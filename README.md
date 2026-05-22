@@ -2,7 +2,7 @@
 
 `diffloop` is a Pi extension that slows down the agentic coding workflow on purpose by presenting each code change to the developer, with a reason attached to it.
 
-![](https://github.com/user-attachments/assets/53d3abf0-5ef4-46af-9ab5-b1924c5dce1c)
+
 
 ## What it does
 
@@ -10,7 +10,7 @@ This extension intercepts Pi `edit` and `write` tool calls and replaces the defa
 
 For each proposed file change, diffloop:
 
-- requires a reason (captured through `set_change_reason`)
+- can require a reason (captured through `set_change_reason`; optional via `/diffloop-reason off`)
 - shows a preview before execution
 - lets you:
   - **approve** the change
@@ -93,14 +93,21 @@ It pushes the agent to provide reasons that are:
 - explicit about behavior impact
 - not generic prose
 
-## Slash command
+## Slash commands
 
 ```text
 /diffloop off
 /diffloop on
 /diffloop toggle
 /diffloop status
+
+/diffloop-reason off
+/diffloop-reason on
+/diffloop-reason toggle
+/diffloop-reason status
 ```
+
+`/diffloop-reason` controls whether the agent must call `set_change_reason` before each edit/write. It defaults to **on**. Turn it **off** when using local models that struggle with the extra tool step.
 
 ## Development
 
@@ -109,3 +116,4 @@ npm install
 npm run build
 npm run typecheck
 ```
+

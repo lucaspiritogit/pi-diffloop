@@ -97,7 +97,9 @@ export async function handleReviewAction(ctx: ExtensionContext, review: ReviewDa
 
         pushLine(headerLines, width, divider);
         pushWrappedLine(headerLines, width, theme.fg("dim", theme.bold(`Review ${review.toolName}: ${review.path}`)));
-        pushWrappedLine(headerLines, width, theme.fg("accent", `Why: ${review.reason}`));
+        if (review.reason) {
+          pushWrappedLine(headerLines, width, theme.fg("accent", `Why: ${review.reason}`));
+        }
         pushWrappedLine(
           headerLines,
           width,

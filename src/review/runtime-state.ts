@@ -29,6 +29,7 @@ export type BlockedToolCallResult = {
 
 export function createDiffloopRuntimeState(initialConfig: DiffloopConfig = loadDiffloopConfig()) {
   let enabled = initialConfig.enabled;
+  let requireReason = initialConfig.requireReason;
   let reviewScope = initialConfig.reviewScope;
   const pendingReadPaths = new Set<string>();
   const pendingChangeReasons: string[] = [];
@@ -275,6 +276,7 @@ export function createDiffloopRuntimeState(initialConfig: DiffloopConfig = loadD
 
   const refreshConfig = (nextConfig: DiffloopConfig = loadDiffloopConfig()) => {
     enabled = nextConfig.enabled;
+    requireReason = nextConfig.requireReason;
     reviewScope = nextConfig.reviewScope;
   };
 
@@ -291,6 +293,10 @@ export function createDiffloopRuntimeState(initialConfig: DiffloopConfig = loadD
     getEnabled: () => enabled,
     setEnabled: (value: boolean) => {
       enabled = value;
+    },
+    getRequireReason: () => requireReason,
+    setRequireReason: (value: boolean) => {
+      requireReason = value;
     },
     getReviewScope: () => reviewScope,
     refreshConfig,
