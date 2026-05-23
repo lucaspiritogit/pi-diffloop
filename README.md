@@ -2,7 +2,7 @@
 
 `diffloop` is a Pi extension that slows down the agentic coding workflow on purpose by presenting each code change to the developer, with a reason attached to it.
 
-
+![diffloop review UI](./assets/image.png)
 
 ## What it does
 
@@ -116,4 +116,3 @@ npm install
 npm run build
 npm run typecheck
 ```
-
