@@ -24,6 +24,7 @@ type DecisionAction = "approve" | "deny" | "steer" | "edit";
 
 type ReviewPipelineDeps = {
   state: DiffloopRuntimeState;
+  diffViewMode: "split" | "inline";
   reasonToolName: string;
   normalizeReasonValue: (reason: unknown) => string;
   normalizeToolCallInput: (toolName: "write" | "edit", input: unknown) => WriteInput | EditInput;
@@ -200,7 +201,7 @@ export async function handleReviewToolCall(
       );
     }
 
-    const action = await handleReviewAction(ctx, review);
+    const action = await handleReviewAction(ctx, review, deps.diffViewMode);
 
     if (action === "approve") {
       if (toolName === "write" && pendingEditedWriteInput) {

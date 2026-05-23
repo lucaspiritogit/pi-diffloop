@@ -58,17 +58,37 @@ When the agent proposes an `edit` or `write`:
 3. it opens a review UI
 4. you choose one of the available actions
 
-## Review scope (optional)
+## Configuration (optional)
 
-By default, diffloop reviews all `edit` and `write` proposals.
+diffloop supports configuration via a global config file and a module-level fallback.
 
-You can scope review to specific files using `diffloop-config.json` next to the installed package (same directory Pi resolves for the extension).
+### Config locations
 
-Config shape:
+| Location | Path | Purpose |
+|---|---|---|
+| **Global** | `~/.pi/agent/extensions/diffloop-config.json` | User-wide defaults (applied first) |
+| **Module** | `diffloop-config.json` next to the installed package | Overrides global config |
+
+Global config is loaded first, then module config is shallow-merged on top (module wins for any key it contains). The `reviewScope` key is replaced entirely if both files define it. If neither file exists, diffloop uses its built-in defaults.
+
+### Config keys
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | `boolean` | `true` | Whether review is enabled |
+| `requireReason` | `boolean` | `true` | Whether the agent must call `set_change_reason` before each edit/write |
+| `diffViewMode` | `"split"` or `"inline"` | `"split"` | How the diff preview is rendered |
+| `reviewScope` | `object` | `{}` | Scope review to specific files/patterns |
+
+### `reviewScope` shape
+
+When present, `reviewScope` controls which files are reviewed:
 
 ```json
 {
   "enabled": true,
+  "requireReason": false,
+  "diffViewMode": "inline",
   "reviewScope": {
     "includePatterns": ["*.ts", "*.tsx"],
     "excludePatterns": ["**/*.snap"],

@@ -1,6 +1,6 @@
 {
   "name": "@lpirito/pi-diffloop",
-  "version": "0.0.28",
+  "version": "0.0.29",
   "description": "Pair programming with Pi, be aware of every change made to the codebase.",
   "scripts": {
     "build": "rm -rf dist && tsc -p tsconfig.json",
@@ -39,8 +39,8 @@
     "typescript": "^5"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "0.74.0",
-    "@earendil-works/pi-tui": "0.74.0",
+    "@earendil-works/pi-coding-agent": ">=0.74.0 <1.0.0",
+    "@earendil-works/pi-tui": ">=0.74.0 <1.0.0",
     "@sinclair/typebox": "*",
     "typescript": "^5"
   },
