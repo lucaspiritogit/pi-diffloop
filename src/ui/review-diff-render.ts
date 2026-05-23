@@ -1,8 +1,22 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import {
+  truncateToWidth,
+  visibleWidth,
+  wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 import type { DiffPreviewLine, ReviewData } from "../review/review-types.js";
-import type { InlineRange, StructuredDiff, StructuredDiffRow } from "../diff/structured-diff.js";
-import { detectSyntaxLanguage, getSyntaxTokenColorAnsi, tokenizeSyntaxLine, type SyntaxSegment } from "../diff/syntax-highlight.js";
+import type {
+  InlineRange,
+  StructuredDiff,
+  StructuredDiffRow,
+} from "../diff/structured-diff.js";
+import {
+  detectSyntaxLanguage,
+  getSyntaxTokenColorAnsi,
+  tokenizeSyntaxLine,
+  type SyntaxSegment,
+} from "../diff/syntax-highlight.js";
+import { createLruCache } from "../lib/lru-cache.js";
 import { pushWrappedLine } from "../lib/utils.js";
 
 const TAB_REPLACEMENT = "    ";
@@ -24,7 +38,10 @@ function padAnsiRight(text: string, width: number): string {
   return `${text}${" ".repeat(padding)}`;
 }
 
-function normalizeRanges(ranges: InlineRange[], maxLength: number): InlineRange[] {
+function normalizeRanges(
+  ranges: InlineRange[],
+  maxLength: number,
+): InlineRange[] {
   return ranges
     .map((range) => ({
       start: clampNumber(range.start, 0, maxLength),
@@ -32,6 +49,24 @@ function normalizeRanges(ranges: InlineRange[], maxLength: number): InlineRange[
     }))
     .filter((range) => range.end > range.start)
     .sort((a, b) => a.start - b.start || a.end - b.end);
+}
+
+// Style output cache — identical (text, ranges, tone, language) → identical ANSI.
+// Theme is excluded from the key because it never changes at runtime.
+const MAX_STYLE_CACHE_SIZE = 10000;
+const styleCache = createLruCache<string>(MAX_STYLE_CACHE_SIZE);
+
+const KEY_SEP = "\x00";
+
+function getStyleCacheKey(
+  text: string,
+  ranges: InlineRange[],
+  tone: string,
+  language: string | undefined,
+): string {
+  if (ranges.length === 0)
+    return `${text}${KEY_SEP}0${KEY_SEP}${tone}${KEY_SEP}${language ?? ""}`;
+  return `${text}${KEY_SEP}${ranges.length}:${ranges.map((r) => `${r.start},${r.end}`).join(";")}${KEY_SEP}${tone}${KEY_SEP}${language ?? ""}`;
 }
 
 function styleSegment(
@@ -43,12 +78,14 @@ function styleSegment(
 ): string {
   if (text.length === 0) return "";
   const tokenColor = getSyntaxTokenColorAnsi(token);
-  const colored = tokenColor ? `${tokenColor}${text}\x1b[39m` : theme.fg(tone, text);
+  const colored = tokenColor
+    ? `${tokenColor}${text}\x1b[39m`
+    : theme.fg(tone, text);
   if (!highlighted) return colored;
   return `\x1b[1m${colored}\x1b[22m`;
 }
 
-function styleDiffText(
+function styleDiffTextInner(
   theme: Theme,
   text: string,
   ranges: InlineRange[],
@@ -61,7 +98,11 @@ function styleDiffText(
 
   const safeRanges = normalizeRanges(ranges, chars.length);
   const syntaxSegments = tokenizeSyntaxLine(normalized, syntaxLanguage);
-  type SyntaxRange = { start: number; end: number; token?: SyntaxSegment["token"] };
+  type SyntaxRange = {
+    start: number;
+    end: number;
+    token?: SyntaxSegment["token"];
+  };
   const syntaxRanges: SyntaxRange[] = [];
   let syntaxCursor = 0;
   for (const segment of syntaxSegments) {
@@ -95,8 +136,16 @@ function styleDiffText(
     const end = orderedBoundaries[i + 1]!;
     if (end <= start) continue;
 
-    while (highlightIndex < safeRanges.length && start >= safeRanges[highlightIndex]!.end) highlightIndex++;
-    while (syntaxIndex < syntaxRanges.length && start >= syntaxRanges[syntaxIndex]!.end) syntaxIndex++;
+    while (
+      highlightIndex < safeRanges.length &&
+      start >= safeRanges[highlightIndex]!.end
+    )
+      highlightIndex++;
+    while (
+      syntaxIndex < syntaxRanges.length &&
+      start >= syntaxRanges[syntaxIndex]!.end
+    )
+      syntaxIndex++;
 
     const highlighted =
       highlightIndex < safeRanges.length &&
@@ -109,10 +158,36 @@ function styleDiffText(
         ? syntaxRanges[syntaxIndex]!.token
         : undefined;
 
-    output += styleSegment(theme, chars.slice(start, end).join(""), tone, highlighted, token);
+    output += styleSegment(
+      theme,
+      chars.slice(start, end).join(""),
+      tone,
+      highlighted,
+      token,
+    );
   }
 
   return output;
+}
+
+function styleDiffText(
+  theme: Theme,
+  text: string,
+  ranges: InlineRange[],
+  tone: "dim" | "success" | "error",
+  syntaxLanguage: string | undefined,
+): string {
+  const key = getStyleCacheKey(text, ranges, tone, syntaxLanguage);
+  const cached = styleCache.get(key);
+  if (cached !== undefined) return cached;
+
+  const result = styleDiffTextInner(theme, text, ranges, tone, syntaxLanguage);
+  styleCache.set(key, result);
+  return result;
+}
+
+export function clearStyleCache(): void {
+  styleCache.clear();
 }
 
 function buildLinePrefix(
@@ -122,9 +197,15 @@ function buildLinePrefix(
   lineNumberWidth: number,
   tone: "dim" | "success" | "error",
 ): string {
-  const numberText = lineNumber === undefined ? "".padStart(lineNumberWidth, " ") : String(lineNumber).padStart(lineNumberWidth, " ");
+  const numberText =
+    lineNumber === undefined
+      ? "".padStart(lineNumberWidth, " ")
+      : String(lineNumber).padStart(lineNumberWidth, " ");
   const signText = sign === " " ? sign : theme.bold(theme.fg(tone, sign));
-  const lineText = sign === " " ? theme.fg("dim", numberText) : theme.bold(theme.fg(tone, numberText));
+  const lineText =
+    sign === " "
+      ? theme.fg("dim", numberText)
+      : theme.bold(theme.fg(tone, numberText));
   return `${signText}${lineText} `;
 }
 
@@ -146,13 +227,23 @@ function renderWrappedCell(
   }
 
   const styled = styleDiffText(theme, text, ranges, tone, syntaxLanguage);
-  const wrapped = wrapTextWithAnsi(styled, contentWidth).map((line) => truncateToWidth(line, contentWidth, "", false));
+  const wrapped = wrapTextWithAnsi(styled, contentWidth).map((line) =>
+    truncateToWidth(line, contentWidth, "", false),
+  );
   const safeWrapped = wrapped.length > 0 ? wrapped : [""];
   const lines: string[] = [];
 
   for (let index = 0; index < safeWrapped.length; index++) {
-    const prefix = index === 0 ? buildLinePrefix(theme, sign, lineNumber, lineNumberWidth, tone) : " ".repeat(prefixWidth);
-    const line = truncateToWidth(`${prefix}${safeWrapped[index]}`, width, "", false);
+    const prefix =
+      index === 0
+        ? buildLinePrefix(theme, sign, lineNumber, lineNumberWidth, tone)
+        : " ".repeat(prefixWidth);
+    const line = truncateToWidth(
+      `${prefix}${safeWrapped[index]}`,
+      width,
+      "",
+      false,
+    );
     lines.push(padAnsiRight(line, width));
   }
 
@@ -167,7 +258,17 @@ function renderUnifiedRow(
   syntaxLanguage: string | undefined,
 ): string[] {
   if (row.kind === "equal") {
-    return renderWrappedCell(theme, " ", row.oldLineNumber, row.oldText, [], "dim", width, lineNumberWidth, syntaxLanguage);
+    return renderWrappedCell(
+      theme,
+      " ",
+      row.oldLineNumber,
+      row.oldText,
+      [],
+      "dim",
+      width,
+      lineNumberWidth,
+      syntaxLanguage,
+    );
   }
   if (row.kind === "delete") {
     return renderWrappedCell(
@@ -222,7 +323,15 @@ function renderUnifiedRow(
   ];
 }
 
-function getSplitLayout(width: number, theme: Theme): { leftWidth: number; rightWidth: number; gutterText: string; gutterWidth: number } {
+function getSplitLayout(
+  width: number,
+  theme: Theme,
+): {
+  leftWidth: number;
+  rightWidth: number;
+  gutterText: string;
+  gutterWidth: number;
+} {
   const gutterText = theme.fg("borderMuted", " │ ");
   const gutterWidth = 3;
   const leftWidth = Math.floor((width - gutterWidth) / 2);
@@ -283,23 +392,39 @@ function renderStructuredDiffLines(
   filePath: string,
 ): string[] {
   const safeWidth = Math.max(20, width);
-  const lineNumberWidth = Math.max(1, String(Math.max(diff.totalOldLines, diff.totalNewLines, 1)).length);
+  const lineNumberWidth = Math.max(
+    1,
+    String(Math.max(diff.totalOldLines, diff.totalNewLines, 1)).length,
+  );
   const syntaxLanguage = detectSyntaxLanguage(filePath);
   const lines: string[] = [];
 
   if (mode === "split") {
     const layout = getSplitLayout(safeWidth, theme);
     const leftTitle = padAnsiRight(
-      truncateToWidth(theme.bold(theme.fg("dim", "Original")), layout.leftWidth, "", false),
+      truncateToWidth(
+        theme.bold(theme.fg("dim", "Original")),
+        layout.leftWidth,
+        "",
+        false,
+      ),
       layout.leftWidth,
     );
     const rightTitle = padAnsiRight(
-      truncateToWidth(theme.bold(theme.fg("dim", "Updated")), layout.rightWidth, "", false),
+      truncateToWidth(
+        theme.bold(theme.fg("dim", "Updated")),
+        layout.rightWidth,
+        "",
+        false,
+      ),
       layout.rightWidth,
     );
     lines.push(leftTitle + layout.gutterText + rightTitle);
     lines.push(
-      theme.fg("borderMuted", `${"─".repeat(layout.leftWidth)}─┼─${"─".repeat(layout.rightWidth)}`),
+      theme.fg(
+        "borderMuted",
+        `${"─".repeat(layout.leftWidth)}─┼─${"─".repeat(layout.rightWidth)}`,
+      ),
     );
 
     for (const item of diff.visibleItems) {
@@ -307,13 +432,31 @@ function renderStructuredDiffLines(
         continue;
       }
 
-      const leftCell = renderSplitCell(theme, item.row, "old", layout.leftWidth, lineNumberWidth, syntaxLanguage);
-      const rightCell = renderSplitCell(theme, item.row, "new", layout.rightWidth, lineNumberWidth, syntaxLanguage);
+      const leftCell = renderSplitCell(
+        theme,
+        item.row,
+        "old",
+        layout.leftWidth,
+        lineNumberWidth,
+        syntaxLanguage,
+      );
+      const rightCell = renderSplitCell(
+        theme,
+        item.row,
+        "new",
+        layout.rightWidth,
+        lineNumberWidth,
+        syntaxLanguage,
+      );
       const totalLines = Math.max(leftCell.length, rightCell.length);
       for (let index = 0; index < totalLines; index++) {
         const left = leftCell[index] ?? " ".repeat(layout.leftWidth);
         const right = rightCell[index] ?? " ".repeat(layout.rightWidth);
-        lines.push(padAnsiRight(left, layout.leftWidth) + layout.gutterText + padAnsiRight(right, layout.rightWidth));
+        lines.push(
+          padAnsiRight(left, layout.leftWidth) +
+            layout.gutterText +
+            padAnsiRight(right, layout.rightWidth),
+        );
       }
     }
     return lines;
@@ -323,14 +466,25 @@ function renderStructuredDiffLines(
     if (item.type === "gap") {
       continue;
     }
-    lines.push(...renderUnifiedRow(theme, item.row, safeWidth, lineNumberWidth, syntaxLanguage));
+    lines.push(
+      ...renderUnifiedRow(
+        theme,
+        item.row,
+        safeWidth,
+        lineNumberWidth,
+        syntaxLanguage,
+      ),
+    );
   }
 
   return lines;
 }
 
 function renderLegacyPreviewLine(
-  line: { kind: "add" | "remove" | "warning" | "meta" | "context"; text: string },
+  line: {
+    kind: "add" | "remove" | "warning" | "meta" | "context";
+    text: string;
+  },
   theme: Theme,
 ): string {
   return line.kind === "add"
@@ -343,6 +497,15 @@ function renderLegacyPreviewLine(
           ? theme.fg("accent", line.text)
           : theme.fg("dim", line.text);
 }
+
+// Diff body cache — per-change, keyed by change object identity.
+// WeakMap auto-clears when the change is GC'd.
+type CachedBody = {
+  diffViewMode: DiffViewMode;
+  width: number;
+  lines: string[];
+};
+let bodyCache = new WeakMap<object, CachedBody>();
 
 export function buildReviewBodyLines(
   review: ReviewData,
@@ -362,7 +525,9 @@ export function buildReviewBodyLines(
   for (const change of review.changes) {
     pushWrappedLine(lines, width, theme.fg("accent", theme.bold(change.title)));
     if (change.diffModel) {
-      const prefaceLines = change.lines.filter((line: DiffPreviewLine) => line.kind === "warning");
+      const prefaceLines = change.lines.filter(
+        (line: DiffPreviewLine) => line.kind === "warning",
+      );
       for (const line of prefaceLines) {
         pushWrappedLine(lines, width, renderLegacyPreviewLine(line, theme));
       }
@@ -371,7 +536,24 @@ export function buildReviewBodyLines(
         lines.push("");
       }
 
-      lines.push(...renderStructuredDiffLines(change.diffModel, width, theme, diffViewMode, review.path));
+      const cached = bodyCache.get(change);
+      if (
+        cached &&
+        cached.diffViewMode === diffViewMode &&
+        cached.width === width
+      ) {
+        lines.push(...cached.lines);
+      } else {
+        const diffLines = renderStructuredDiffLines(
+          change.diffModel,
+          width,
+          theme,
+          diffViewMode,
+          review.path,
+        );
+        bodyCache.set(change, { diffViewMode, width, lines: diffLines });
+        lines.push(...diffLines);
+      }
       lines.push("");
       continue;
     }
@@ -387,4 +569,8 @@ export function buildReviewBodyLines(
   }
 
   return lines;
+}
+
+export function clearReviewBodyCache(): void {
+  bodyCache = new WeakMap();
 }

@@ -20,6 +20,8 @@ import {
   sanitizeToolCallInput,
 } from "../tools/edit-write-input.js";
 import { normalizePath } from "../lib/utils.js";
+import { clearSyntaxTokenCache } from "../diff/syntax-highlight.js";
+import { clearReviewBodyCache, clearStyleCache } from "../ui/review-diff-render.js";
 
 const DIFFLOOP_REVIEW_STATUS = "diffloop";
 const DIFFLOOP_REASON_TOOL_NAME = "set_change_reason";
@@ -182,6 +184,9 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
 
   pi.on("session_shutdown", async () => {
     state.resetForSessionBoundary();
+    clearSyntaxTokenCache();
+    clearStyleCache();
+    clearReviewBodyCache();
   });
 
   pi.on("input", async (event, ctx) => {

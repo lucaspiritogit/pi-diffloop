@@ -38,6 +38,25 @@ export async function handleReviewAction(ctx: ExtensionContext, review: ReviewDa
       let lastVisibleContentRows = 1;
       const steeringInput = new Input();
 
+      // Cached full review body — rebuilt only on mode/width change.
+      let cachedBodyLines: string[] | null = null;
+      let cachedWidth = 0;
+      let cachedDiffViewMode: DiffViewMode = diffViewMode;
+
+      const ensureBodyLines = (width: number) => {
+        if (cachedBodyLines && cachedWidth === width && cachedDiffViewMode === diffViewMode) {
+          return cachedBodyLines;
+        }
+        cachedBodyLines = buildReviewBodyLines(review, width, theme, diffViewMode);
+        cachedWidth = width;
+        cachedDiffViewMode = diffViewMode;
+        return cachedBodyLines;
+      };
+
+      const invalidateBodyCache = () => {
+        cachedBodyLines = null;
+      };
+
       const actionLabel = (action: ReviewAction) => {
         if (actions[selected] === action) {
           return theme.bg("selectedBg", theme.fg("text", action));
@@ -141,6 +160,7 @@ export async function handleReviewAction(ctx: ExtensionContext, review: ReviewDa
 
           if (data === "v" || data === "V") {
             diffViewMode = diffViewMode === "split" ? "inline" : "split";
+            invalidateBodyCache();
             tui.requestRender();
             return;
           }
@@ -205,7 +225,7 @@ export async function handleReviewAction(ctx: ExtensionContext, review: ReviewDa
 
         render(width: number) {
           const { headerLines, divider } = buildHeaderLines(width);
-          const bodyLines = buildReviewBodyLines(review, width, theme, diffViewMode);
+          const bodyLines = ensureBodyLines(width);
           const contentLines = [...headerLines, ...bodyLines];
 
           const buildFooterLines = (hint: string) => {
