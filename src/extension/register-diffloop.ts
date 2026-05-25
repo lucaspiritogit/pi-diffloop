@@ -207,6 +207,7 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
   pi.on("tool_call", async (event, ctx) => {
     return handleReviewToolCall(event, ctx, {
       state,
+      diffViewMode: state.getDiffViewMode(),
       reasonToolName: DIFFLOOP_REASON_TOOL_NAME,
       normalizeReasonValue,
       normalizeToolCallInput,

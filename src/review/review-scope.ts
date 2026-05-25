@@ -1,4 +1,5 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, extname, join, resolve } from "node:path";
 import { normalizePath } from "../lib/utils.js";
 
@@ -17,8 +18,9 @@ type ReviewScopeConfigShape = Partial<{
 }>;
 
 type DiffloopConfigShape = Partial<{
-  enabled: unknown;
-  requireReason: unknown;
+  enabled: boolean;
+  requireReason: boolean;
+  diffViewMode: "split" | "inline";
   reviewScope: ReviewScopeConfigShape;
 }> &
   ReviewScopeConfigShape;
@@ -26,10 +28,30 @@ type DiffloopConfigShape = Partial<{
 export type DiffloopConfig = {
   enabled: boolean;
   requireReason: boolean;
+  diffViewMode: "split" | "inline";
   reviewScope: ReviewScope;
 };
 
 export const DIFFLOOP_CONFIG_FILE_NAME = "diffloop-config.json";
+
+const GLOBAL_CONFIG_PATH = join(homedir(), ".pi", "agent", "extensions", "diffloop-config.json");
+
+let cachedConfig: DiffloopConfig | null = null;
+
+function mergeConfig(target: Record<string, unknown>, source: unknown): void {
+  if (typeof source !== "object" || source === null || Array.isArray(source)) return;
+  for (const key of Object.keys(source as object)) {
+    if (key === "reviewScope") {
+      target[key] = (source as Record<string, unknown>)[key];
+    } else {
+      target[key] = (source as Record<string, unknown>)[key];
+    }
+  }
+}
+
+export function clearConfigCache(): void {
+  cachedConfig = null;
+}
 
 function parseList(input: unknown): string[] {
   if (Array.isArray(input)) {
@@ -148,22 +170,48 @@ function parseRequireReason(rawConfig: unknown): boolean {
   return typeof requireReasonValue === "boolean" ? requireReasonValue : true;
 }
 
+function parseDiffViewMode(rawConfig: unknown): "split" | "inline" {
+  if (!rawConfig || typeof rawConfig !== "object") return "split";
+  const value = (rawConfig as DiffloopConfigShape).diffViewMode;
+  if (value === "split" || value === "inline") return value;
+  return "split";
+}
+
 export function loadDiffloopConfig(configPath = resolveDiffloopConfigPath()): DiffloopConfig {
-  try {
-    const raw = readFileSync(configPath, "utf8");
-    const parsed = JSON.parse(raw);
-    return {
-      enabled: parseEnabled(parsed),
-      requireReason: parseRequireReason(parsed),
-      reviewScope: parseReviewScopeConfig(parsed),
-    };
-  } catch {
-    return {
-      enabled: true,
-      requireReason: true,
-      reviewScope: parseReviewScopeConfig({}),
-    };
+  if (cachedConfig) return cachedConfig;
+
+  const merged: Record<string, unknown> = {};
+
+  // Tier 1: Global (~/.pi/agent/diffloop-config.json)
+  if (existsSync(GLOBAL_CONFIG_PATH)) {
+    try {
+      const raw = JSON.parse(readFileSync(GLOBAL_CONFIG_PATH, "utf8"));
+      if (typeof raw === "object" && raw !== null && !Array.isArray(raw)) {
+        Object.assign(merged, raw);
+      }
+    } catch {
+      // ignore malformed global config
+    }
   }
+
+  // Tier 2: Module fallback (same path as resolveDiffloopConfigPath default)
+  if (existsSync(configPath)) {
+    try {
+      const raw = JSON.parse(readFileSync(configPath, "utf8"));
+      mergeConfig(merged, raw);
+    } catch {
+      // ignore malformed module config
+    }
+  }
+
+  cachedConfig = {
+    enabled: parseEnabled(merged),
+    requireReason: parseRequireReason(merged),
+    diffViewMode: parseDiffViewMode(merged),
+    reviewScope: parseReviewScopeConfig(merged),
+  };
+
+  return cachedConfig;
 }
 
 export function saveEnabledToConfig(enabled: boolean, configPath = resolveDiffloopConfigPath()): void {

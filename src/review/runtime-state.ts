@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { loadDiffloopConfig, type DiffloopConfig } from "./review-scope.js";
+import { clearConfigCache, loadDiffloopConfig, type DiffloopConfig } from "./review-scope.js";
 import type { EditBlock } from "./review-types.js";
 import { normalizePath } from "../lib/utils.js";
 
@@ -30,6 +30,7 @@ export type BlockedToolCallResult = {
 export function createDiffloopRuntimeState(initialConfig: DiffloopConfig = loadDiffloopConfig()) {
   let enabled = initialConfig.enabled;
   let requireReason = initialConfig.requireReason;
+  let diffViewMode = initialConfig.diffViewMode;
   let reviewScope = initialConfig.reviewScope;
   const pendingReadPaths = new Set<string>();
   const pendingChangeReasons: string[] = [];
@@ -275,8 +276,10 @@ export function createDiffloopRuntimeState(initialConfig: DiffloopConfig = loadD
   };
 
   const refreshConfig = (nextConfig: DiffloopConfig = loadDiffloopConfig()) => {
+    clearConfigCache();
     enabled = nextConfig.enabled;
     requireReason = nextConfig.requireReason;
+    diffViewMode = nextConfig.diffViewMode;
     reviewScope = nextConfig.reviewScope;
   };
 
@@ -298,6 +301,7 @@ export function createDiffloopRuntimeState(initialConfig: DiffloopConfig = loadD
     setRequireReason: (value: boolean) => {
       requireReason = value;
     },
+    getDiffViewMode: () => diffViewMode,
     getReviewScope: () => reviewScope,
     refreshConfig,
     setDenyHold: (value: boolean) => {

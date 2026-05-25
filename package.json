@@ -39,8 +39,8 @@
     "typescript": "^5"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "0.74.0",
-    "@earendil-works/pi-tui": "0.74.0",
+    "@earendil-works/pi-coding-agent": ">=0.74.0 <1.0.0",
+    "@earendil-works/pi-tui": ">=0.74.0 <1.0.0",
     "@sinclair/typebox": "*",
     "typescript": "^5"
   },

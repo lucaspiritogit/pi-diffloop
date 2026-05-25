@@ -24,7 +24,7 @@ function countReviewDiffStats(review: ReviewData): { additions: number; removals
   return { additions, removals };
 }
 
-export async function handleReviewAction(ctx: ExtensionContext, review: ReviewData): Promise<ReviewDecision> {
+export async function handleReviewAction(ctx: ExtensionContext, review: ReviewData, diffViewMode: DiffViewMode = "split"): Promise<ReviewDecision> {
   return ctx.ui.custom<ReviewDecision>(
     (tui, theme, _keybindings, done) => {
       const actions: ReviewAction[] = ["approve", "steer", "edit", "deny"];
@@ -32,7 +32,6 @@ export async function handleReviewAction(ctx: ExtensionContext, review: ReviewDa
       let steeringMode = false;
       let steeringError: string | undefined;
       let focused = false;
-      let diffViewMode: DiffViewMode = "split";
       let previewScrollOffset = 0;
       let lastContentLineCount = 0;
       let lastVisibleContentRows = 1;
