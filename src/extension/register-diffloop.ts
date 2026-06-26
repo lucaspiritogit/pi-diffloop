@@ -305,7 +305,7 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
     }
 
     const isEditOrWriteError = (event.toolName === "edit" || event.toolName === "write") && event.isError;
-    if (isEditOrWriteError) {
+    if (state.getEnabled() && isEditOrWriteError) {
       const failedPath = typeof event.input?.path === "string" ? normalizePath(event.input.path) : "";
       if (!failedPath) return undefined;
 
