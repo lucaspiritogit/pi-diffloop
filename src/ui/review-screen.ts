@@ -46,7 +46,6 @@ export async function handleReviewAction(
   ctx: ExtensionContext,
   review: ReviewData,
   diffViewMode: DiffViewMode = "split",
-  onDiffViewModeChange?: (mode: DiffViewMode) => void,
 ): Promise<ReviewDecision> {
   return ctx.ui.custom<ReviewDecision>(
     (tui, theme, _keybindings, done) => {
@@ -149,8 +148,12 @@ export async function handleReviewAction(
           const fileProgress = getFileProgress(plannedFiles, currentPath);
           pushLine(headerLines, width, planDivider);
           pushWrappedLine(headerLines, width, theme.bold(theme.fg("warning", "Plan preview")));
-          pushWrappedLine(headerLines, width, formatPlanLine(theme, "Goal", review.plan.goal || "(not stated)", "accent"));
-          pushWrappedLine(headerLines, width, formatPlanLine(theme, "Now", review.plan.currentStep || "(not stated)", "accent"));
+          if (review.plan.goal !== undefined) {
+            pushWrappedLine(headerLines, width, formatPlanLine(theme, "Goal", review.plan.goal || "(not stated)", "accent"));
+          }
+          if (review.plan.currentStep !== undefined) {
+            pushWrappedLine(headerLines, width, formatPlanLine(theme, "Now", review.plan.currentStep || "(not stated)", "accent"));
+          }
           if (fileProgress) {
             pushWrappedLine(headerLines, width, formatPlanLine(theme, "File", fileProgress.current, "warning"));
             pushWrappedLine(headerLines, width, formatPlanLine(theme, "Files to review", formatPlanList(fileProgress.remaining, "(none)")));
@@ -208,7 +211,6 @@ export async function handleReviewAction(
 
           if (data === "v" || data === "V") {
             diffViewMode = diffViewMode === "split" ? "inline" : "split";
-            onDiffViewModeChange?.(diffViewMode);
             invalidateBodyCache();
             tui.requestRender();
             return;

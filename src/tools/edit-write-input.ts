@@ -75,13 +75,14 @@ export function normalizeToolCallInput(toolName: "write" | "edit", input: unknow
   return normalizeEditInput(raw);
 }
 
-export function normalizeReviewModeAction(args?: string): "on" | "off" | "toggle" | "status" | "invalid" {
+export function normalizeReviewModeAction(args?: string): "on" | "off" | "toggle" | "status" | "config" | "invalid" {
   const action = (args ?? "status").trim().toLowerCase();
 
   if (!action || action === "status") return "status";
   if (action === "on" || action === "enable" || action === "enabled") return "on";
   if (action === "off" || action === "disable" || action === "disabled") return "off";
   if (action === "toggle") return "toggle";
+  if (action === "config" || action === "edit-config" || action === "settings") return "config";
   return "invalid";
 }
 

@@ -77,7 +77,23 @@ Global config is loaded first, then module config is shallow-merged on top (modu
 | -------------- | ----------------------- | --------- | --------------------------------------- |
 | `enabled`      | `boolean`               | `true`    | Whether review is enabled               |
 | `diffViewMode` | `"split"` or `"inline"` | `"split"` | How the diff preview is rendered        |
+| `plan`         | `object`                | `{}`      | Controls agent plan prompting/UI        |
 | `reviewScope`  | `object`                | `{}`      | Scope review to specific files/patterns |
+
+### `plan` shape
+
+Use `plan.enabled` to disable the plan helper entirely. Use `plan.goal` and `plan.current` to hide only those fields while keeping planned files.
+
+```json
+{
+  "enabled": true,
+  "plan": {
+    "enabled": true,
+    "goal": false,
+    "current": false
+  }
+}
+```
 
 ### `reviewScope` shape
 
@@ -122,6 +138,7 @@ If the agent proposes a change to a file that is not listed in `plannedFiles`, d
 /diffloop on
 /diffloop toggle
 /diffloop status
+/diffloop config
 ```
 
 ## Development

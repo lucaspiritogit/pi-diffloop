@@ -10,6 +10,12 @@ export type ReviewScope = {
   excludeExtensions: string[];
 };
 
+export type PlanConfig = {
+  enabled: boolean;
+  goal: boolean;
+  current: boolean;
+};
+
 type ReviewScopeConfigShape = Partial<{
   includePatterns: unknown;
   excludePatterns: unknown;
@@ -20,6 +26,11 @@ type ReviewScopeConfigShape = Partial<{
 type DiffloopConfigShape = Partial<{
   enabled: boolean;
   diffViewMode: "split" | "inline";
+  plan: Partial<{
+    enabled: unknown;
+    goal: unknown;
+    current: unknown;
+  }>;
   reviewScope: ReviewScopeConfigShape;
 }> &
   ReviewScopeConfigShape;
@@ -27,6 +38,7 @@ type DiffloopConfigShape = Partial<{
 export type DiffloopConfig = {
   enabled: boolean;
   diffViewMode: "split" | "inline";
+  plan: PlanConfig;
   reviewScope: ReviewScope;
 };
 
@@ -39,7 +51,15 @@ let cachedConfig: DiffloopConfig | null = null;
 function mergeConfig(target: Record<string, unknown>, source: unknown): void {
   if (typeof source !== "object" || source === null || Array.isArray(source)) return;
   for (const key of Object.keys(source as object)) {
-    if (key === "reviewScope") {
+    if (key === "plan") {
+      const value = (source as Record<string, unknown>)[key];
+      target[key] = {
+        ...(typeof target[key] === "object" && target[key] !== null && !Array.isArray(target[key])
+          ? (target[key] as Record<string, unknown>)
+          : {}),
+        ...(typeof value === "object" && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {}),
+      };
+    } else if (key === "reviewScope") {
       target[key] = (source as Record<string, unknown>)[key];
     } else {
       target[key] = (source as Record<string, unknown>)[key];
@@ -169,6 +189,19 @@ function parseDiffViewMode(rawConfig: unknown): "split" | "inline" {
   return "split";
 }
 
+function parsePlanConfig(rawConfig: unknown): PlanConfig {
+  const rawPlan =
+    rawConfig && typeof rawConfig === "object" && typeof (rawConfig as DiffloopConfigShape).plan === "object"
+      ? (rawConfig as DiffloopConfigShape).plan
+      : {};
+
+  return {
+    enabled: typeof rawPlan?.enabled === "boolean" ? rawPlan.enabled : true,
+    goal: typeof rawPlan?.goal === "boolean" ? rawPlan.goal : true,
+    current: typeof rawPlan?.current === "boolean" ? rawPlan.current : true,
+  };
+}
+
 export function loadDiffloopConfig(configPath = resolveDiffloopConfigPath()): DiffloopConfig {
   if (cachedConfig) return cachedConfig;
 
@@ -199,6 +232,7 @@ export function loadDiffloopConfig(configPath = resolveDiffloopConfigPath()): Di
   cachedConfig = {
     enabled: parseEnabled(merged),
     diffViewMode: parseDiffViewMode(merged),
+    plan: parsePlanConfig(merged),
     reviewScope: parseReviewScopeConfig(merged),
   };
 

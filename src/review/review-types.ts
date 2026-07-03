@@ -12,8 +12,8 @@ export type ReviewAction = "approve" | "steer" | "edit" | "deny";
 export type ReviewDecision = Exclude<ReviewAction, "steer"> | { action: "steer"; steering: string };
 
 export type ReviewPlan = {
-  goal: string;
-  currentStep: string;
+  goal?: string;
+  currentStep?: string;
   plannedFiles: string[];
 };
 

@@ -3,7 +3,6 @@ import { handleReviewAction } from "../ui/review-screen.js";
 import { isPathInReviewScope, loadDiffloopConfig } from "./review-scope.js";
 import type { EditInput, ReviewData, ReviewPlan, WriteInput } from "./review-types.js";
 import type { DiffloopRuntimeState } from "./runtime-state.js";
-import type { DiffViewMode } from "../ui/review-diff-render.js";
 import {
   buildBlockedEditApprovalInstruction,
   buildDeveloperEditedProposalInstruction,
@@ -24,8 +23,6 @@ type DecisionAction = "approve" | "deny" | "steer" | "edit";
 
 type ReviewPipelineDeps = {
   state: DiffloopRuntimeState;
-  diffViewMode: "split" | "inline";
-  onDiffViewModeChange: (mode: DiffViewMode) => void;
   planToolName: string;
   normalizeReviewPlan: (input: unknown) => ReviewPlan | undefined;
   normalizeToolCallInput: (toolName: "write" | "edit", input: unknown) => WriteInput | EditInput;
@@ -180,7 +177,7 @@ export async function handleReviewToolCall(
       );
     }
 
-    const action = await handleReviewAction(ctx, review, deps.diffViewMode, deps.onDiffViewModeChange);
+    const action = await handleReviewAction(ctx, review, deps.state.getDiffViewMode());
 
     if (action === "approve") {
       deps.sanitizeToolCallInput(event, toolName, proposedInput);

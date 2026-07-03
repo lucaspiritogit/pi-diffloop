@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import { clearConfigCache, loadDiffloopConfig, type DiffloopConfig } from "./review-scope.js";
+import { clearConfigCache, loadDiffloopConfig, type DiffloopConfig, type PlanConfig } from "./review-scope.js";
 import type { EditBlock, ReviewPlan } from "./review-types.js";
 import { normalizePath } from "../lib/utils.js";
 
@@ -30,6 +30,7 @@ export type BlockedToolCallResult = {
 export function createDiffloopRuntimeState(initialConfig: DiffloopConfig = loadDiffloopConfig()) {
   let enabled = initialConfig.enabled;
   let diffViewMode = initialConfig.diffViewMode;
+  let planConfig: PlanConfig = initialConfig.plan;
   let reviewScope = initialConfig.reviewScope;
   let reviewPlan: ReviewPlan | undefined;
   const pendingReadPaths = new Set<string>();
@@ -258,6 +259,8 @@ export function createDiffloopRuntimeState(initialConfig: DiffloopConfig = loadD
   const refreshConfig = (nextConfig: DiffloopConfig = loadDiffloopConfig()) => {
     clearConfigCache();
     enabled = nextConfig.enabled;
+    diffViewMode = nextConfig.diffViewMode;
+    planConfig = nextConfig.plan;
     reviewScope = nextConfig.reviewScope;
   };
 
@@ -276,9 +279,7 @@ export function createDiffloopRuntimeState(initialConfig: DiffloopConfig = loadD
       enabled = value;
     },
     getDiffViewMode: () => diffViewMode,
-    setDiffViewMode: (value: "split" | "inline") => {
-      diffViewMode = value;
-    },
+    getPlanConfig: () => planConfig,
     getReviewScope: () => reviewScope,
     getReviewPlan: () => reviewPlan,
     setReviewPlan: (value: ReviewPlan | undefined) => {
