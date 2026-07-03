@@ -131,7 +131,6 @@ export async function editProposal(
 
     return {
       path: normalizePath(writeInput.path),
-      reason: writeInput.reason.trim(),
       content,
     };
   }
@@ -145,7 +144,6 @@ export async function editProposal(
 
     return normalizeEditInput({
       path: current.path,
-      reason: current.reason,
       edits: [{ oldText: edit.oldText, newText: content }],
     });
   }
@@ -179,7 +177,6 @@ export async function editProposal(
 
   return normalizeEditInput({
     path: current.path,
-    reason: current.reason,
     edits: current.edits.map((edit: EditBlock, index: number) =>
       index === selectedIndex ? { oldText: edit.oldText, newText: content } : edit,
     ),

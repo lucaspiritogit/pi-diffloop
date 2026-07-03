@@ -3,8 +3,9 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { handleReviewAction } from "../ui/review-screen.js";
 import { isPathInReviewScope, loadDiffloopConfig } from "./review-scope.js";
-import type { EditInput, ReviewData, WriteInput } from "./review-types.js";
+import type { EditInput, ReviewData, ReviewPlan, WriteInput } from "./review-types.js";
 import type { DiffloopRuntimeState } from "./runtime-state.js";
+import type { DiffViewMode } from "../ui/review-diff-render.js";
 import {
   buildBlockedEditApprovalInstruction,
   buildMissingTargetEditInstruction,
@@ -25,8 +26,9 @@ type DecisionAction = "approve" | "deny" | "steer" | "edit";
 type ReviewPipelineDeps = {
   state: DiffloopRuntimeState;
   diffViewMode: "split" | "inline";
-  reasonToolName: string;
-  normalizeReasonValue: (reason: unknown) => string;
+  onDiffViewModeChange: (mode: DiffViewMode) => void;
+  planToolName: string;
+  normalizeReviewPlan: (input: unknown) => ReviewPlan | undefined;
   normalizeToolCallInput: (toolName: "write" | "edit", input: unknown) => WriteInput | EditInput;
   sanitizeToolCallInput: (
     event: { input: unknown },
@@ -37,16 +39,15 @@ type ReviewPipelineDeps = {
     ctx: ExtensionContext,
     toolName: "write" | "edit",
     input: WriteInput | EditInput,
+    plan: ReviewPlan | undefined,
   ) => Promise<ReviewData>;
   editProposal: (
     ctx: ExtensionContext,
     toolName: "write" | "edit",
     input: WriteInput | EditInput,
   ) => Promise<WriteInput | EditInput | undefined>;
-  sendSteeringFeedback: (message: string) => boolean;
   blockWithReason: BlockWithReason;
-  onDecision: (decision: { action: DecisionAction; toolName: "write" | "edit"; path: string; reason?: string }) => void;
-  onDenyAbort: (ctx: ExtensionContext) => void;
+  onDecision: (decision: { action: DecisionAction; toolName: "write" | "edit"; path: string }) => void;
 };
 
 export async function handleReviewToolCall(
@@ -54,19 +55,19 @@ export async function handleReviewToolCall(
   ctx: ExtensionContext,
   deps: ReviewPipelineDeps,
 ): Promise<ToolCallEventResult | undefined> {
-  const isReasonToolCall = event.toolName === deps.reasonToolName;
+  const isPlanToolCall = event.toolName === deps.planToolName;
 
-  if (!deps.state.getEnabled() && isReasonToolCall) {
+  if (!deps.state.getEnabled() && isPlanToolCall) {
     return deps.blockWithReason(
-      `Blocked ${deps.reasonToolName}: diffloop is off. Enable it with /diffloop on before using this tool.`,
-      `${deps.reasonToolName}:disabled`,
-      { code: "reason-tool-disabled" },
+      `Blocked ${deps.planToolName}: diffloop is off. Enable it with /diffloop on before using this tool.`,
+      `${deps.planToolName}:disabled`,
+      { code: "plan-tool-disabled" },
     );
   }
 
   if (
     !deps.state.getEnabled() ||
-    (!isReasonToolCall &&
+    (!isPlanToolCall &&
       !isToolCallEventType("edit", event) &&
       !isToolCallEventType("write", event) &&
       !isToolCallEventType("read", event))
@@ -74,21 +75,17 @@ export async function handleReviewToolCall(
     return undefined;
   }
 
-  if (isReasonToolCall) {
-    const reason = deps.normalizeReasonValue((event.input as { reason?: unknown } | undefined)?.reason);
-    if (!reason) {
-      if (deps.state.getRequireReason()) {
-        return deps.blockWithReason(
-          `Blocked ${deps.reasonToolName}: include a non-empty reason and retry.`,
-          `${deps.reasonToolName}:empty`,
-          { code: "reason-tool-empty" },
-        );
-      }
-      return undefined;
+  if (isPlanToolCall) {
+    const plan = deps.normalizeReviewPlan(event.input);
+    if (!plan) {
+      return deps.blockWithReason(
+        `Blocked ${deps.planToolName}: include at least a goal or currentStep and retry.`,
+        `${deps.planToolName}:empty`,
+        { code: "plan-tool-empty" },
+      );
     }
-
-    deps.state.queuePendingChangeReason(reason);
-    event.input = { reason };
+    deps.state.setReviewPlan(plan);
+    event.input = plan;
     return undefined;
   }
 
@@ -109,7 +106,6 @@ export async function handleReviewToolCall(
   }
 
   const toolName = event.toolName;
-  let resolvedChangeReason: string | undefined;
   let pendingEditedWriteInput: WriteInput | undefined;
   let proposalEditedInReview = false;
 
@@ -150,7 +146,6 @@ export async function handleReviewToolCall(
     const normalizedInputPath = proposedInput.path;
     deps.state.refreshConfig(loadDiffloopConfig());
     if (!isPathInReviewScope(normalizedInputPath, deps.state.getReviewScope())) {
-      deps.state.consumePendingChangeReason();
       return undefined;
     }
 
@@ -163,19 +158,7 @@ export async function handleReviewToolCall(
       );
     }
 
-    if (!resolvedChangeReason) {
-      resolvedChangeReason = deps.normalizeReasonValue(proposedInput.reason) || deps.state.consumePendingChangeReason();
-    }
-    proposedInput.reason = resolvedChangeReason ?? "";
-    if (!proposedInput.reason && deps.state.getRequireReason()) {
-      return deps.blockWithReason(
-        `Blocked ${toolName}: call ${deps.reasonToolName} first with a concrete reason, then retry one ${toolName} proposal.`,
-        `${toolName}:missing-reason`,
-        { code: "missing-reason", toolName, path: normalizedInputPath },
-      );
-    }
-
-    const review = await deps.buildReviewData(ctx, toolName, proposedInput);
+    const review = await deps.buildReviewData(ctx, toolName, proposedInput, deps.state.getReviewPlan());
     if (toolName === "edit" && review.editPreviewValidation && !review.editPreviewValidation.canApprove) {
       if (review.editPreviewValidation.missingTarget) {
         ctx.ui.notify(
@@ -183,8 +166,8 @@ export async function handleReviewToolCall(
           "warning",
         );
         return deps.blockWithReason(
-          buildMissingTargetEditInstruction(review.path, proposedInput as EditInput),
-          `edit:missing-target:${review.path}:${proposedInput.reason}`,
+          buildMissingTargetEditInstruction(review.path),
+          `edit:missing-target:${review.path}`,
           { code: "missing-target", toolName, path: review.path },
         );
       }
@@ -195,13 +178,13 @@ export async function handleReviewToolCall(
         "warning",
       );
       return deps.blockWithReason(
-        buildBlockedEditApprovalInstruction(review.path, proposedInput as EditInput, review),
-        `edit:invalid-preview:${review.path}:${proposedInput.reason}:${(review.editPreviewValidation.errors ?? []).join("|")}`,
+        buildBlockedEditApprovalInstruction(review.path, review),
+        `edit:invalid-preview:${review.path}:${(review.editPreviewValidation.errors ?? []).join("|")}`,
         { code: "invalid-preview", toolName, path: review.path },
       );
     }
 
-    const action = await handleReviewAction(ctx, review, deps.diffViewMode);
+    const action = await handleReviewAction(ctx, review, deps.diffViewMode, deps.onDiffViewModeChange);
 
     if (action === "approve") {
       if (toolName === "write" && pendingEditedWriteInput) {
@@ -230,7 +213,6 @@ export async function handleReviewToolCall(
         action: "approve",
         toolName,
         path: review.path,
-        reason: proposedInput.reason,
       });
       return undefined;
     }
@@ -242,13 +224,12 @@ export async function handleReviewToolCall(
         action: "deny",
         toolName,
         path: review.path,
-        reason: proposedInput.reason,
       });
-      deps.onDenyAbort(ctx);
-      return {
-        block: true,
-        reason: "",
-      };
+      return deps.blockWithReason(
+        `Diffloop denied ${toolName} for ${review.path}. No file changes were applied. Stop and wait for a new user prompt.`,
+        `${toolName}:denied:${review.path}`,
+        { code: "denied", toolName, path: review.path },
+      );
     }
 
     if (typeof action === "object" && action.action === "steer") {
@@ -258,14 +239,16 @@ export async function handleReviewToolCall(
         continue;
       }
 
-      const sent = deps.sendSteeringFeedback(message);
       deps.onDecision({
         action: "steer",
         toolName,
         path: review.path,
-        reason: proposedInput.reason,
       });
-      return { block: true, reason: sent ? "" : message };
+      return deps.blockWithReason(
+        `${message}\nNo file changes were applied.`,
+        `${toolName}:steered:${review.path}`,
+        { code: "steered", toolName, path: review.path },
+      );
     }
 
     const updated = await deps.editProposal(ctx, toolName, proposedInput);
@@ -283,7 +266,6 @@ export async function handleReviewToolCall(
       action: "edit",
       toolName,
       path: normalizePath(updated.path),
-      reason: deps.normalizeReasonValue(updated.reason),
     });
   }
 }

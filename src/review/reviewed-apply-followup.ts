@@ -22,11 +22,6 @@ export function buildReviewedMutationInstruction(toolName: "write" | "edit", pat
   ].join(" ");
 }
 
-export function buildReviewedMutationSteeringBrief(toolName: "write" | "edit", path: string): string {
-  const normalizedPath = normalizePath(path) || "(unknown path)";
-  return `Diffloop: developer-reviewed ${toolName} applied for ${normalizedPath}. The tool result starts with the on-disk file snapshot—use that as the source of truth for what changed.`;
-}
-
 export async function readUtf8SnippetAfterApply(cwd: string, path: string): Promise<string> {
   const normalized = normalizePath(path);
   if (!normalized) return "(invalid path)";
@@ -44,7 +39,7 @@ export async function buildReviewedApplyToolResultContent(
   ctx: ExtensionContext,
   pending: PendingReviewedMutationLike,
   inputPath: string | undefined,
-): Promise<{ text: string; steeringBrief: string }> {
+): Promise<{ text: string }> {
   const path = pending.path || inputPath || "";
   const instruction = buildReviewedMutationInstruction(pending.toolName, path);
   let snapshot: string;
@@ -63,6 +58,5 @@ export async function buildReviewedApplyToolResultContent(
   ].join("\n");
   return {
     text: followUp,
-    steeringBrief: buildReviewedMutationSteeringBrief(pending.toolName, path),
   };
 }

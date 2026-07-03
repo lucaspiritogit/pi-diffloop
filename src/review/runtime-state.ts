@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import { clearConfigCache, loadDiffloopConfig, type DiffloopConfig } from "./review-scope.js";
-import type { EditBlock } from "./review-types.js";
+import type { EditBlock, ReviewPlan } from "./review-types.js";
 import { normalizePath } from "../lib/utils.js";
 
 type PendingWriteOverride = {
@@ -29,11 +29,10 @@ export type BlockedToolCallResult = {
 
 export function createDiffloopRuntimeState(initialConfig: DiffloopConfig = loadDiffloopConfig()) {
   let enabled = initialConfig.enabled;
-  let requireReason = initialConfig.requireReason;
   let diffViewMode = initialConfig.diffViewMode;
   let reviewScope = initialConfig.reviewScope;
+  let reviewPlan: ReviewPlan | undefined;
   const pendingReadPaths = new Set<string>();
-  const pendingChangeReasons: string[] = [];
   let denyHold = false;
   const pendingWriteOverridesByCallId = new Map<string, PendingWriteOverride>();
   const pendingWriteOverridesByPath = new Map<string, PendingWriteOverride[]>();
@@ -44,25 +43,6 @@ export function createDiffloopRuntimeState(initialConfig: DiffloopConfig = loadD
 
   const buildBlockedResult = (reason: string): BlockedToolCallResult => {
     return { block: true, reason };
-  };
-
-  const clearPendingChangeReasons = () => {
-    pendingChangeReasons.length = 0;
-  };
-
-  const queuePendingChangeReason = (reason: string): boolean => {
-    const normalizedReason = reason.trim();
-    if (!normalizedReason) return false;
-    pendingChangeReasons.push(normalizedReason);
-    return true;
-  };
-
-  const consumePendingChangeReason = (): string | undefined => {
-    while (pendingChangeReasons.length > 0) {
-      const reason = pendingChangeReasons.shift()?.trim();
-      if (reason) return reason;
-    }
-    return undefined;
   };
 
   const clearReadRequirements = () => {
@@ -278,14 +258,12 @@ export function createDiffloopRuntimeState(initialConfig: DiffloopConfig = loadD
   const refreshConfig = (nextConfig: DiffloopConfig = loadDiffloopConfig()) => {
     clearConfigCache();
     enabled = nextConfig.enabled;
-    requireReason = nextConfig.requireReason;
-    diffViewMode = nextConfig.diffViewMode;
     reviewScope = nextConfig.reviewScope;
   };
 
   const resetForSessionBoundary = () => {
     clearReadRequirements();
-    clearPendingChangeReasons();
+    reviewPlan = undefined;
     clearPendingWriteOverrides();
     clearPendingEditOverrides();
     clearPendingReviewedMutations();
@@ -297,21 +275,24 @@ export function createDiffloopRuntimeState(initialConfig: DiffloopConfig = loadD
     setEnabled: (value: boolean) => {
       enabled = value;
     },
-    getRequireReason: () => requireReason,
-    setRequireReason: (value: boolean) => {
-      requireReason = value;
-    },
     getDiffViewMode: () => diffViewMode,
+    setDiffViewMode: (value: "split" | "inline") => {
+      diffViewMode = value;
+    },
     getReviewScope: () => reviewScope,
+    getReviewPlan: () => reviewPlan,
+    setReviewPlan: (value: ReviewPlan | undefined) => {
+      reviewPlan = value;
+    },
+    clearReviewPlan: () => {
+      reviewPlan = undefined;
+    },
     refreshConfig,
     setDenyHold: (value: boolean) => {
       denyHold = value;
     },
     getDenyHold: () => denyHold,
     buildBlockedResult,
-    clearPendingChangeReasons,
-    queuePendingChangeReason,
-    consumePendingChangeReason,
     clearReadRequirements,
     setPendingReadRequirements,
     listPendingReadPaths,

@@ -1,7 +1,7 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Input, Key, matchesKey } from "@earendil-works/pi-tui";
 import type { ReviewAction, ReviewData, ReviewDecision } from "../review/review-types.js";
-import { pushLine, pushWrappedLine } from "../lib/utils.js";
+import { normalizePath, pushLine, pushWrappedLine } from "../lib/utils.js";
 import { buildReviewBodyLines, type DiffViewMode } from "./review-diff-render.js";
 
 function countReviewDiffStats(review: ReviewData): { additions: number; removals: number } {
@@ -24,7 +24,30 @@ function countReviewDiffStats(review: ReviewData): { additions: number; removals
   return { additions, removals };
 }
 
-export async function handleReviewAction(ctx: ExtensionContext, review: ReviewData, diffViewMode: DiffViewMode = "split"): Promise<ReviewDecision> {
+function formatPlanList(items: string[], fallback: string): string {
+  return items.length > 0 ? items.join(", ") : fallback;
+}
+
+function formatPlanLine(theme: ExtensionContext["ui"]["theme"], label: string, value: string, tone: "text" | "accent" | "warning" = "text"): string {
+  return `${theme.bold(theme.fg("accent", `${label}:`))} ${theme.fg(tone, value)}`;
+}
+
+function getFileProgress(plannedFiles: string[], currentPath: string): { current: string; remaining: string[] } | undefined {
+  const currentIndex = plannedFiles.indexOf(currentPath);
+  if (currentIndex < 0) return undefined;
+
+  return {
+    current: `${currentIndex + 1}/${plannedFiles.length}`,
+    remaining: plannedFiles.slice(currentIndex + 1),
+  };
+}
+
+export async function handleReviewAction(
+  ctx: ExtensionContext,
+  review: ReviewData,
+  diffViewMode: DiffViewMode = "split",
+  onDiffViewModeChange?: (mode: DiffViewMode) => void,
+): Promise<ReviewDecision> {
   return ctx.ui.custom<ReviewDecision>(
     (tui, theme, _keybindings, done) => {
       const actions: ReviewAction[] = ["approve", "steer", "edit", "deny"];
@@ -111,12 +134,38 @@ export async function handleReviewAction(ctx: ExtensionContext, review: ReviewDa
         const headerLines: string[] = [];
         const innerWidth = Math.max(20, width - 2);
         const divider = theme.fg("borderAccent", "─".repeat(innerWidth));
+        const planDivider = theme.fg("borderAccent", "─".repeat(Math.min(innerWidth, 72)));
         const diffStats = countReviewDiffStats(review);
 
         pushLine(headerLines, width, divider);
-        pushWrappedLine(headerLines, width, theme.fg("dim", theme.bold(`Review ${review.toolName}: ${review.path}`)));
-        if (review.reason) {
-          pushWrappedLine(headerLines, width, theme.fg("accent", `Why: ${review.reason}`));
+        pushWrappedLine(
+          headerLines,
+          width,
+          `${theme.bold(theme.fg("toolTitle", `Review ${review.toolName}:`))} ${theme.bold(theme.fg("accent", review.path))}`,
+        );
+        if (review.plan) {
+          const plannedFiles = review.plan.plannedFiles.map(normalizePath).filter(Boolean);
+          const currentPath = normalizePath(review.path);
+          const fileProgress = getFileProgress(plannedFiles, currentPath);
+          pushLine(headerLines, width, planDivider);
+          pushWrappedLine(headerLines, width, theme.bold(theme.fg("warning", "Plan preview")));
+          pushWrappedLine(headerLines, width, formatPlanLine(theme, "Goal", review.plan.goal || "(not stated)", "accent"));
+          pushWrappedLine(headerLines, width, formatPlanLine(theme, "Now", review.plan.currentStep || "(not stated)", "accent"));
+          if (fileProgress) {
+            pushWrappedLine(headerLines, width, formatPlanLine(theme, "File", fileProgress.current, "warning"));
+            pushWrappedLine(headerLines, width, formatPlanLine(theme, "Files to review", formatPlanList(fileProgress.remaining, "(none)")));
+          } else {
+            pushWrappedLine(headerLines, width, formatPlanLine(theme, "Files to review", formatPlanList(plannedFiles, "(none listed)")));
+          }
+          if (plannedFiles.length > 0 && !plannedFiles.includes(currentPath)) {
+            pushWrappedLine(headerLines, width, theme.bold(theme.fg("warning", `Plan warning: ${currentPath} is not listed in planned files.`)));
+          }
+          pushLine(headerLines, width, planDivider);
+        } else {
+          pushLine(headerLines, width, planDivider);
+          pushWrappedLine(headerLines, width, theme.bold(theme.fg("warning", "Plan preview: no plan snapshot yet.")));
+          pushWrappedLine(headerLines, width, theme.fg("text", "Ask the agent to update set_change_plan if the path is unclear."));
+          pushLine(headerLines, width, planDivider);
         }
         pushWrappedLine(
           headerLines,
@@ -159,6 +208,7 @@ export async function handleReviewAction(ctx: ExtensionContext, review: ReviewDa
 
           if (data === "v" || data === "V") {
             diffViewMode = diffViewMode === "split" ? "inline" : "split";
+            onDiffViewModeChange?.(diffViewMode);
             invalidateBodyCache();
             tui.requestRender();
             return;
@@ -262,7 +312,9 @@ export async function handleReviewAction(ctx: ExtensionContext, review: ReviewDa
           let footerLines = buildFooterLines(hint);
 
           for (let i = 0; i < 2; i++) {
-            const availableRows = Math.max(1, tui.terminal.rows - footerLines.length);
+            const baseAvailableRows = Math.max(1, tui.terminal.rows - footerLines.length);
+            const hasMoreBelow = previewScrollOffset + baseAvailableRows < contentLines.length;
+            const availableRows = Math.max(1, baseAvailableRows - (hasMoreBelow ? 1 : 0));
             lastContentLineCount = contentLines.length;
             lastVisibleContentRows = availableRows;
             const maxOffset = clampPreviewScroll();
@@ -281,13 +333,19 @@ export async function handleReviewAction(ctx: ExtensionContext, review: ReviewDa
             footerLines = buildFooterLines(hint);
           }
 
-          const availableRows = Math.max(1, tui.terminal.rows - footerLines.length);
+          const baseAvailableRows = Math.max(1, tui.terminal.rows - footerLines.length);
+          const shouldReserveMoreIndicator = previewScrollOffset + baseAvailableRows < contentLines.length;
+          const availableRows = Math.max(1, baseAvailableRows - (shouldReserveMoreIndicator ? 1 : 0));
           lastContentLineCount = contentLines.length;
           lastVisibleContentRows = availableRows;
           clampPreviewScroll();
 
           const visibleContent = contentLines.slice(previewScrollOffset, previewScrollOffset + availableRows);
-          return [...visibleContent, ...footerLines];
+          const hasMoreBelow = previewScrollOffset + availableRows < contentLines.length;
+          const moreIndicator = hasMoreBelow
+            ? [theme.bold(theme.fg("warning", "↓ more below - scroll to continue"))]
+            : [];
+          return [...visibleContent, ...moreIndicator, ...footerLines];
         },
       };
     },

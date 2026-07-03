@@ -1,4 +1,4 @@
-import type { EditInput, ReviewData } from "../review/review-types.js";
+import type { ReviewData } from "../review/review-types.js";
 import { normalizePath } from "../lib/utils.js";
 
 export function buildSteeringInstruction(
@@ -26,15 +26,13 @@ export function joinPathList(paths: string[]): string {
   return `${paths.slice(0, -1).join(", ")}, and ${paths[paths.length - 1]}`;
 }
 
-export function buildBlockedEditApprovalInstruction(path: string, input: EditInput, review: ReviewData): string {
+export function buildBlockedEditApprovalInstruction(path: string, review: ReviewData): string {
   const normalizedPath = normalizePath(path);
-  const currentReason = typeof input.reason === "string" && input.reason.trim() ? input.reason.trim() : undefined;
   const validationErrors = review.editPreviewValidation?.errors ?? ["Native preview validation failed."];
 
   return [
     `Do not execute the previous edit for ${normalizedPath}.`,
     `Native preview failed: ${validationErrors.join("; ")}`,
-    currentReason ? `Previous reason: ${currentReason}` : undefined,
     `Read ${normalizedPath}, then propose a new exact-match edit with unique oldText blocks.`,
     "If exact matching still fails, switch to write with full file content.",
   ]
@@ -42,14 +40,12 @@ export function buildBlockedEditApprovalInstruction(path: string, input: EditInp
     .join("\n");
 }
 
-export function buildMissingTargetEditInstruction(path: string, input: EditInput): string {
+export function buildMissingTargetEditInstruction(path: string): string {
   const normalizedPath = normalizePath(path);
-  const currentReason = typeof input.reason === "string" && input.reason.trim() ? input.reason.trim() : undefined;
 
   return [
     `Do not execute the previous edit for ${normalizedPath}.`,
     "Target file is missing, so edit cannot apply.",
-    currentReason ? `Previous reason: ${currentReason}` : undefined,
     `Submit one write proposal for ${normalizedPath}.`,
     "If needed, regenerate full content from repository context before writing.",
   ]

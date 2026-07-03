@@ -10,56 +10,69 @@ import { applyEditBlocksToContent } from "../diff/diff-preview.js";
 import { buildReviewData } from "../review/build-review-data.js";
 import { editProposal } from "../review/proposal-editor.js";
 import { handleReviewToolCall } from "../review/review-pipeline.js";
-import { loadDiffloopConfig, saveEnabledToConfig, saveRequireReasonToConfig } from "../review/review-scope.js";
+import { loadDiffloopConfig, saveEnabledToConfig } from "../review/review-scope.js";
 import { buildReviewedApplyToolResultContent } from "../review/reviewed-apply-followup.js";
 import { createDiffloopRuntimeState } from "../review/runtime-state.js";
 import {
-  normalizeReasonValue,
   normalizeReviewModeAction,
   normalizeToolCallInput,
   sanitizeToolCallInput,
 } from "../tools/edit-write-input.js";
+import type { ReviewPlan } from "../review/review-types.js";
 import { normalizePath } from "../lib/utils.js";
 import { clearSyntaxTokenCache } from "../diff/syntax-highlight.js";
 import { clearReviewBodyCache, clearStyleCache } from "../ui/review-diff-render.js";
 
 const DIFFLOOP_REVIEW_STATUS = "diffloop";
-const DIFFLOOP_REASON_TOOL_NAME = "set_change_reason";
-const DIFFLOOP_REASON_GUIDANCE =
-  `Before every edit/write tool call, call ${DIFFLOOP_REASON_TOOL_NAME} first with one concrete reason tied to repository context and behavior impact.`;
+const DIFFLOOP_PLAN_TOOL_NAME = "set_change_plan";
+const LEGACY_REASON_TOOL_NAME = "set_change_reason";
+const DIFFLOOP_PLAN_GUIDANCE = [
+  `Before the first edit/write for a task, call ${DIFFLOOP_PLAN_TOOL_NAME} with a compact plan.`,
+  `Refresh ${DIFFLOOP_PLAN_TOOL_NAME} whenever the goal, current step, or planned files change.`,
+  "Keep the plan short: one goal, one current step, and expected files.",
+  "Order plannedFiles in the review order that is easiest to validate: lower-level dependencies first, then helpers/functions/services, then routes/controllers/UI. If there is no clear dependency chain, use the cleanest reading order for the task.",
+].join("\n");
+
+function normalizeList(input: unknown): string[] {
+  if (!Array.isArray(input)) return [];
+  return input.filter((value): value is string => typeof value === "string").map((value) => value.trim()).filter(Boolean);
+}
+
+function normalizeReviewPlan(input: unknown): ReviewPlan | undefined {
+  const raw = (input && typeof input === "object" ? input : {}) as Record<string, unknown>;
+  const plan: ReviewPlan = {
+    goal: typeof raw.goal === "string" ? raw.goal.trim() : "",
+    currentStep: typeof raw.currentStep === "string" ? raw.currentStep.trim() : "",
+    plannedFiles: normalizeList(raw.plannedFiles).map(normalizePath).filter(Boolean),
+  };
+  return plan.goal || plan.currentStep ? plan : undefined;
+}
 
 export default function registerDiffloopExtension(pi: ExtensionAPI) {
   const state = createDiffloopRuntimeState(loadDiffloopConfig());
-
-  const sendSteeringFeedback = (message: string): boolean => {
-    try {
-      pi.sendUserMessage(message, { deliverAs: "steer" });
-      return true;
-    } catch {
-      return false;
-    }
-  };
 
   const blockWithReason = (reason: string, _key?: string, _meta?: { code: string; toolName?: "write" | "edit"; path?: string }) => {
     return state.buildBlockedResult(reason);
   };
 
-  const syncReasonToolActivation = () => {
+  const syncPlanToolActivation = () => {
     const api = pi as Partial<Pick<ExtensionAPI, "getActiveTools" | "setActiveTools">>;
     if (typeof api.getActiveTools !== "function" || typeof api.setActiveTools !== "function") return;
 
     const activeTools = api.getActiveTools();
-    const withoutReasonTool = activeTools.filter((toolName) => toolName !== DIFFLOOP_REASON_TOOL_NAME);
+    const withoutDiffloopTools = activeTools.filter(
+      (toolName) => toolName !== DIFFLOOP_PLAN_TOOL_NAME && toolName !== LEGACY_REASON_TOOL_NAME,
+    );
 
-    if (state.getEnabled() && state.getRequireReason()) {
-      if (!activeTools.includes(DIFFLOOP_REASON_TOOL_NAME)) {
-        api.setActiveTools([...withoutReasonTool, DIFFLOOP_REASON_TOOL_NAME]);
+    if (state.getEnabled()) {
+      if (!activeTools.includes(DIFFLOOP_PLAN_TOOL_NAME) || withoutDiffloopTools.length !== activeTools.length - 1) {
+        api.setActiveTools([...withoutDiffloopTools, DIFFLOOP_PLAN_TOOL_NAME]);
       }
       return;
     }
 
-    if (withoutReasonTool.length !== activeTools.length) {
-      api.setActiveTools(withoutReasonTool);
+    if (withoutDiffloopTools.length !== activeTools.length) {
+      api.setActiveTools(withoutDiffloopTools);
     }
   };
 
@@ -71,7 +84,7 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
 
       if (action === "invalid") {
         ctx.ui.notify("Usage: /diffloop [on|off|toggle|status]", "error");
-        displayDiffloopStatus(ctx, enabled, state.getRequireReason(), false);
+        displayDiffloopStatus(ctx, enabled, false);
         return;
       }
 
@@ -93,93 +106,58 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
 
       if (wasEnabled && !nextEnabled) {
         state.setDenyHold(false);
-        state.clearPendingChangeReasons();
+        state.clearReviewPlan();
         state.clearReadRequirements();
       }
 
-      syncReasonToolActivation();
-      displayDiffloopStatus(ctx, state.getEnabled(), state.getRequireReason(), true);
-    },
-  });
-
-  pi.registerCommand("diffloop-reason", {
-    description: "Set required change reasons on, off, toggle, or show status",
-    handler: async (args, ctx) => {
-      const action = normalizeReviewModeAction(args);
-      const requireReason = state.getRequireReason();
-
-      if (action === "invalid") {
-        ctx.ui.notify("Usage: /diffloop-reason [on|off|toggle|status]", "error");
-        displayDiffloopStatus(ctx, state.getEnabled(), requireReason, false);
-        return;
-      }
-
-      let nextRequireReason = requireReason;
-      if (action === "toggle") nextRequireReason = !requireReason;
-      if (action === "on") nextRequireReason = true;
-      if (action === "off") nextRequireReason = false;
-      state.setRequireReason(nextRequireReason);
-
-      if (action !== "status") {
-        try {
-          saveRequireReasonToConfig(nextRequireReason);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          ctx.ui.notify(`Failed to persist diffloop reason state: ${message}`, "warning");
-        }
-        if (!nextRequireReason) {
-          state.clearPendingChangeReasons();
-        }
-        syncReasonToolActivation();
-      }
-
-      displayDiffloopStatus(ctx, state.getEnabled(), nextRequireReason, false);
-      if (action !== "status" && ctx.hasUI) {
-        ctx.ui.notify(
-          nextRequireReason ? "Change reasons required" : "Change reasons optional",
-          nextRequireReason ? "warning" : "info",
-        );
-      }
+      syncPlanToolActivation();
+      displayDiffloopStatus(ctx, state.getEnabled(), true);
     },
   });
 
   pi.registerTool?.({
-    name: DIFFLOOP_REASON_TOOL_NAME,
-    label: DIFFLOOP_REASON_TOOL_NAME,
-    description: "Record the reason for the next edit/write proposal.",
-    promptSnippet: "Record reason before each edit/write",
+    name: DIFFLOOP_PLAN_TOOL_NAME,
+    label: DIFFLOOP_PLAN_TOOL_NAME,
+    description: "Record the current task plan shown above diffloop reviews.",
+    promptSnippet: "Record compact task plan before editing",
     promptGuidelines: [
-      `Before each edit/write call, use ${DIFFLOOP_REASON_TOOL_NAME} with one concrete reason tied to current code.`,
+      `Before the first edit/write call, use ${DIFFLOOP_PLAN_TOOL_NAME} with a compact task plan.`,
+      `Refresh ${DIFFLOOP_PLAN_TOOL_NAME} when the approach or planned files change.`,
     ],
     parameters: Type.Object({
-      reason: Type.String({ description: "Concrete reason for the next file mutation." }),
+      goal: Type.String({ description: "Overall user-facing goal for the task." }),
+      currentStep: Type.String({ description: "What the next edit/write is trying to accomplish." }),
+      plannedFiles: Type.Array(Type.String(), {
+        description:
+          "Files expected to be edited or written, ordered for review from lower-level dependencies to higher-level callers or UI.",
+      }),
     }),
-    async execute(_toolCallId, params: { reason: string }) {
+    async execute(_toolCallId, params: ReviewPlan) {
       return {
-        content: [{ type: "text" as const, text: `Reason recorded: ${params.reason.trim()}` }],
+        content: [{ type: "text" as const, text: `Plan recorded: ${params.goal.trim() || params.currentStep.trim()}` }],
         details: undefined,
       };
     },
   });
 
   pi.on("before_agent_start", async (event) => {
-    if (!state.getEnabled() || !state.getRequireReason()) return undefined;
+    if (!state.getEnabled()) return undefined;
 
     return {
-      systemPrompt: `${event.systemPrompt}\n\n${DIFFLOOP_REASON_GUIDANCE}`,
+      systemPrompt: `${event.systemPrompt}\n\n${DIFFLOOP_PLAN_GUIDANCE}`,
     };
   });
 
   pi.on("session_start", async (_event, ctx) => {
     state.refreshConfig(loadDiffloopConfig());
     state.resetForSessionBoundary();
-    syncReasonToolActivation();
-    displayDiffloopStatus(ctx, state.getEnabled(), state.getRequireReason(), false);
+    syncPlanToolActivation();
+    displayDiffloopStatus(ctx, state.getEnabled(), false);
   });
 
   pi.on("session_tree", async (_event, ctx) => {
     state.resetForSessionBoundary();
-    displayDiffloopStatus(ctx, state.getEnabled(), state.getRequireReason(), false);
+    displayDiffloopStatus(ctx, state.getEnabled(), false);
   });
 
   pi.on("session_shutdown", async () => {
@@ -191,7 +169,7 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
 
   pi.on("input", async (event, ctx) => {
     if (event.source !== "extension") {
-      state.clearPendingChangeReasons();
+      state.clearReviewPlan();
     }
 
     if (!state.getDenyHold()) return;
@@ -208,18 +186,15 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
     return handleReviewToolCall(event, ctx, {
       state,
       diffViewMode: state.getDiffViewMode(),
-      reasonToolName: DIFFLOOP_REASON_TOOL_NAME,
-      normalizeReasonValue,
+      onDiffViewModeChange: state.setDiffViewMode,
+      planToolName: DIFFLOOP_PLAN_TOOL_NAME,
+      normalizeReviewPlan,
       normalizeToolCallInput,
       sanitizeToolCallInput,
       buildReviewData,
       editProposal,
-      sendSteeringFeedback,
       blockWithReason,
       onDecision: () => {},
-      onDenyAbort: (pipelineCtx: ExtensionContext) => {
-        pipelineCtx.abort();
-      },
     });
   });
 
@@ -330,8 +305,7 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
     }
 
     if (!event.isError && pendingReviewedMutation) {
-      const { text, steeringBrief } = await buildReviewedApplyToolResultContent(ctx, pendingReviewedMutation, inputPath);
-      sendSteeringFeedback(steeringBrief);
+      const { text } = await buildReviewedApplyToolResultContent(ctx, pendingReviewedMutation, inputPath);
       return {
         content: [{ type: "text" as const, text }],
         details: event.details,
@@ -341,27 +315,13 @@ export default function registerDiffloopExtension(pi: ExtensionAPI) {
   });
 }
 
-function displayDiffloopStatus(
-  ctx: ExtensionContext,
-  enabled: boolean,
-  requireReason: boolean,
-  announce = false,
-) {
+function displayDiffloopStatus(ctx: ExtensionContext, enabled: boolean, announce = false) {
   if (!ctx.hasUI) return;
 
   const reviewStatus = enabled ? ctx.ui.theme.fg("warning", "diffloop on") : ctx.ui.theme.fg("dim", "diffloop off");
-  const reasonStatus = requireReason
-    ? ctx.ui.theme.fg("accent", "review reason on")
-    : ctx.ui.theme.fg("dim", "review reason off");
-  const baseStatusText = enabled ? `${reviewStatus} • ${reasonStatus}` : reviewStatus;
 
-  ctx.ui.setStatus(DIFFLOOP_REVIEW_STATUS, baseStatusText);
+  ctx.ui.setStatus(DIFFLOOP_REVIEW_STATUS, reviewStatus);
   if (announce) {
-    const message = !enabled
-      ? "Diffloop off"
-      : requireReason
-        ? "Diffloop on"
-        : "Diffloop reasons optional";
-    ctx.ui.notify(message, enabled ? "warning" : "info");
+    ctx.ui.notify(enabled ? "Diffloop on" : "Diffloop off", enabled ? "warning" : "info");
   }
 }

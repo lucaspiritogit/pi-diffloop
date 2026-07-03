@@ -1,6 +1,6 @@
 # diffloop
 
-`diffloop` is a Pi extension that slows down the agentic coding workflow on purpose by presenting each code change to the developer, with a reason attached to it.
+`diffloop` is a Pi extension that slows down the agentic coding workflow on purpose by presenting each code change to the developer, with a compact task plan attached to it.
 
 ![diffloop review UI](./assets/image.png)
 
@@ -10,8 +10,8 @@ This extension intercepts Pi `edit` and `write` tool calls and replaces the defa
 
 For each proposed file change, diffloop:
 
-- can require a reason (captured through `set_change_reason`; optional via `/diffloop-reason off`)
 - shows a preview before execution
+- shows the agent's current goal, step, and planned files
 - lets you:
   - **approve** the change
   - **steer** the change with an inline prompt
@@ -24,7 +24,7 @@ For each proposed file change, diffloop:
 pi install npm:@lpirito/pi-diffloop
 ```
 
-## Why use it
+## Why does diffloop exist?
 
 When working with coding agents, I kept running into two extremes:
 
@@ -64,21 +64,20 @@ diffloop supports configuration via a global config file and a module-level fall
 
 ### Config locations
 
-| Location | Path | Purpose |
-|---|---|---|
-| **Global** | `~/.pi/agent/extensions/diffloop-config.json` | User-wide defaults (applied first) |
-| **Module** | `diffloop-config.json` next to the installed package | Overrides global config |
+| Location   | Path                                                 | Purpose                            |
+| ---------- | ---------------------------------------------------- | ---------------------------------- |
+| **Global** | `~/.pi/agent/extensions/diffloop-config.json`        | User-wide defaults (applied first) |
+| **Module** | `diffloop-config.json` next to the installed package | Overrides global config            |
 
 Global config is loaded first, then module config is shallow-merged on top (module wins for any key it contains). The `reviewScope` key is replaced entirely if both files define it. If neither file exists, diffloop uses its built-in defaults.
 
 ### Config keys
 
-| Key | Type | Default | Description |
-|---|---|---|---|
-| `enabled` | `boolean` | `true` | Whether review is enabled |
-| `requireReason` | `boolean` | `true` | Whether the agent must call `set_change_reason` before each edit/write |
-| `diffViewMode` | `"split"` or `"inline"` | `"split"` | How the diff preview is rendered |
-| `reviewScope` | `object` | `{}` | Scope review to specific files/patterns |
+| Key            | Type                    | Default   | Description                             |
+| -------------- | ----------------------- | --------- | --------------------------------------- |
+| `enabled`      | `boolean`               | `true`    | Whether review is enabled               |
+| `diffViewMode` | `"split"` or `"inline"` | `"split"` | How the diff preview is rendered        |
+| `reviewScope`  | `object`                | `{}`      | Scope review to specific files/patterns |
 
 ### `reviewScope` shape
 
@@ -87,7 +86,6 @@ When present, `reviewScope` controls which files are reviewed:
 ```json
 {
   "enabled": true,
-  "requireReason": false,
   "diffViewMode": "inline",
   "reviewScope": {
     "includePatterns": ["*.ts", "*.tsx"],
@@ -100,18 +98,22 @@ When present, `reviewScope` controls which files are reviewed:
 
 Out-of-scope paths bypass diffloop review and run through Pi's normal tool execution.
 
-## Agent prompt behavior
+## Agent plan behavior
 
 This extension does **not** re-register the `edit` and `write` tools.
 
-Instead, it registers a small helper tool called `set_change_reason` and prompts the agent to call it before each `edit`/`write` proposal.
+Instead, it registers a small helper tool called `set_change_plan` and prompts the agent to call it before the first `edit`/`write` proposal for a task, then refresh it whenever the approach changes.
 
-It pushes the agent to provide reasons that are:
+The review UI shows the latest plan snapshot above every diff:
 
-- specific
-- grounded in existing code or repository patterns
-- explicit about behavior impact
-- not generic prose
+- **Goal**: the overall task objective
+- **Now**: the current step
+- **File**: current file position in the planned review order
+- **Files to review**: planned files after the current one
+
+`plannedFiles` should be ordered from lower-level dependencies toward higher-level callers or UI when the task has a clear dependency chain.
+
+If the agent proposes a change to a file that is not listed in `plannedFiles`, diffloop shows a warning but does not block the review.
 
 ## Slash commands
 
@@ -120,14 +122,7 @@ It pushes the agent to provide reasons that are:
 /diffloop on
 /diffloop toggle
 /diffloop status
-
-/diffloop-reason off
-/diffloop-reason on
-/diffloop-reason toggle
-/diffloop-reason status
 ```
-
-`/diffloop-reason` controls whether the agent must call `set_change_reason` before each edit/write. It defaults to **on**. Turn it **off** when using local models that struggle with the extra tool step.
 
 ## Development
 

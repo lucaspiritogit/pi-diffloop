@@ -19,7 +19,6 @@ type ReviewScopeConfigShape = Partial<{
 
 type DiffloopConfigShape = Partial<{
   enabled: boolean;
-  requireReason: boolean;
   diffViewMode: "split" | "inline";
   reviewScope: ReviewScopeConfigShape;
 }> &
@@ -27,7 +26,6 @@ type DiffloopConfigShape = Partial<{
 
 export type DiffloopConfig = {
   enabled: boolean;
-  requireReason: boolean;
   diffViewMode: "split" | "inline";
   reviewScope: ReviewScope;
 };
@@ -164,12 +162,6 @@ function parseEnabled(rawConfig: unknown): boolean {
   return typeof enabledValue === "boolean" ? enabledValue : true;
 }
 
-function parseRequireReason(rawConfig: unknown): boolean {
-  if (!rawConfig || typeof rawConfig !== "object") return true;
-  const requireReasonValue = (rawConfig as DiffloopConfigShape).requireReason;
-  return typeof requireReasonValue === "boolean" ? requireReasonValue : true;
-}
-
 function parseDiffViewMode(rawConfig: unknown): "split" | "inline" {
   if (!rawConfig || typeof rawConfig !== "object") return "split";
   const value = (rawConfig as DiffloopConfigShape).diffViewMode;
@@ -206,7 +198,6 @@ export function loadDiffloopConfig(configPath = resolveDiffloopConfigPath()): Di
 
   cachedConfig = {
     enabled: parseEnabled(merged),
-    requireReason: parseRequireReason(merged),
     diffViewMode: parseDiffViewMode(merged),
     reviewScope: parseReviewScopeConfig(merged),
   };
@@ -227,22 +218,6 @@ export function saveEnabledToConfig(enabled: boolean, configPath = resolveDifflo
   }
 
   base.enabled = enabled;
-  writeFileSync(configPath, `${JSON.stringify(base, null, 2)}\n`, "utf8");
-}
-
-export function saveRequireReasonToConfig(requireReason: boolean, configPath = resolveDiffloopConfigPath()): void {
-  let base: Record<string, unknown> = {};
-
-  try {
-    const raw = readFileSync(configPath, "utf8");
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-      base = { ...(parsed as Record<string, unknown>) };
-    }
-  } catch {
-  }
-
-  base.requireReason = requireReason;
   writeFileSync(configPath, `${JSON.stringify(base, null, 2)}\n`, "utf8");
 }
 

@@ -11,7 +11,7 @@ import {
   runNativeEditPreview,
   runNativeWritePreview,
 } from "../diff/diff-preview.js";
-import type { EditBlock, EditInput, NativeEditBlockStatus, ReviewData, WriteInput } from "./review-types.js";
+import type { EditBlock, EditInput, NativeEditBlockStatus, ReviewData, ReviewPlan, WriteInput } from "./review-types.js";
 import { buildStructuredDiff } from "../diff/structured-diff.js";
 import { normalizePath } from "../lib/utils.js";
 import { normalizeEditInput } from "../tools/edit-write-input.js";
@@ -20,9 +20,9 @@ export async function buildReviewData(
   ctx: ExtensionContext,
   toolName: "write" | "edit",
   input: WriteInput | EditInput,
+  plan: ReviewPlan | undefined,
 ): Promise<ReviewData> {
   const path = normalizePath(input.path);
-  const reason = input.reason.trim();
   const absolutePath = resolve(ctx.cwd, path);
   let existingContent: string | undefined;
   try {
@@ -49,7 +49,7 @@ export async function buildReviewData(
     return {
       toolName,
       path,
-      reason,
+      plan,
       summary,
       changes: [
         {
@@ -70,7 +70,7 @@ export async function buildReviewData(
     return {
       toolName,
       path,
-      reason,
+      plan,
       summary: [
         ...summary,
         "Preview warning: target file does not exist on disk",
@@ -125,7 +125,7 @@ export async function buildReviewData(
   return {
     toolName,
     path,
-    reason,
+    plan,
     summary,
     editPreviewValidation: {
       canApprove,

@@ -18,7 +18,7 @@ export function normalizeEditArguments(args: any) {
           Boolean(edit) && typeof edit.oldText === "string" && typeof edit.newText === "string",
       )
     : [];
-  const { oldText, newText, ...rest } = input;
+  const { oldText, newText, reason: _reason, ...rest } = input;
 
   if (typeof oldText === "string" && typeof newText === "string") {
     return {
@@ -37,10 +37,6 @@ export function normalizeEditArguments(args: any) {
   return args;
 }
 
-export function normalizeReasonValue(reason: unknown): string {
-  return typeof reason === "string" ? reason.trim() : "";
-}
-
 export function normalizeEditInput(input: EditInput): EditInput {
   const edits = Array.isArray(input.edits)
     ? input.edits
@@ -53,7 +49,6 @@ export function normalizeEditInput(input: EditInput): EditInput {
 
   return {
     path: normalizePath(input.path),
-    reason: input.reason?.trim() ?? "",
     edits,
   };
 }
@@ -62,13 +57,11 @@ function normalizeWriteInput(input: unknown): WriteInput {
   const raw = (input && typeof input === "object" ? input : {}) as {
     path?: unknown;
     content?: unknown;
-    reason?: unknown;
   };
 
   return {
     path: normalizePath(typeof raw.path === "string" ? raw.path : ""),
     content: typeof raw.content === "string" ? raw.content : "",
-    reason: typeof raw.reason === "string" ? raw.reason.trim() : "",
   };
 }
 

@@ -11,10 +11,16 @@ export type DiffPreviewLine = {
 export type ReviewAction = "approve" | "steer" | "edit" | "deny";
 export type ReviewDecision = Exclude<ReviewAction, "steer"> | { action: "steer"; steering: string };
 
+export type ReviewPlan = {
+  goal: string;
+  currentStep: string;
+  plannedFiles: string[];
+};
+
 export type ReviewData = {
   toolName: "write" | "edit";
   path: string;
-  reason: string;
+  plan?: ReviewPlan;
   summary: string[];
   changes: Array<{ title: string; lines: DiffPreviewLine[]; diffModel?: StructuredDiff }>;
   editPreviewValidation?: {
@@ -25,8 +31,8 @@ export type ReviewData = {
 };
 
 export type EditBlock = EditToolInput["edits"][number];
-export type EditInput = EditToolInput & { reason: string };
-export type WriteInput = WriteToolInput & { reason: string };
+export type EditInput = EditToolInput;
+export type WriteInput = WriteToolInput;
 
 export type NativeEditPreviewResult = { ok: true; diff?: string } | { ok: false; error: string; diff?: string };
 
