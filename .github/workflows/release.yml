@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_bump:
+        description: Version bump
+        type: choice
+        default: patch
+        options:
+          - patch
+          - minor
+          - major
+      release_notes:
+        description: Release notes (leave empty to auto-generate from commits)
+        type: string
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+
+      - name: Bump version
+        run: npm version ${{ inputs.version_bump }} --no-git-tag-version
+
+      - name: Build and typecheck
+        run: npm run check
+
+      - name: Publish to npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Read version
+        id: version
+        run: echo "value=$(node -p \"require('./package.json').version\")" >> "$GITHUB_OUTPUT"
+
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          git commit -m "chore(release): v${{ steps.version.outputs.value }}"
+
+      - name: Push and tag
+        run: |
+          git tag "v${{ steps.version.outputs.value }}"
+          git push origin HEAD --tags
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ steps.version.outputs.value }}"
+          if [ -n "${{ inputs.release_notes }}" ]; then
+            gh release create "$TAG" --title "$TAG" --notes "${{ inputs.release_notes }}"
+          else
+            gh release create "$TAG" --title "$TAG" --generate-notes
+          fi

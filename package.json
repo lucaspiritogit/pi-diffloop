@@ -8,8 +8,9 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "check": "npm run build && npm run typecheck",
     "release:dry": "npm run check && npm publish --dry-run",
-    "release": "npm run check && npm version patch && npm publish --access public",
-    "release:patch": "npm version patch && npm publish --access public"
+    "release": "node scripts/release.mjs patch",
+    "release:minor": "node scripts/release.mjs minor",
+    "release:major": "node scripts/release.mjs major"
   },
   "files": [
     "src"
