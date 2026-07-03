@@ -1,5 +1,6 @@
-import type { ReviewData } from "../review/review-types.js";
+import type { EditInput, ReviewData, WriteInput } from "../review/review-types.js";
 import { normalizePath } from "../lib/utils.js";
+import { normalizeEditInput } from "./edit-write-input.js";
 
 export function buildSteeringInstruction(
   toolName: "write" | "edit",
@@ -17,6 +18,38 @@ export function buildSteeringInstruction(
   ]
     .filter((line): line is string => Boolean(line))
     .join("\n");
+}
+
+export function buildDeveloperEditedProposalInstruction(
+  toolName: "write" | "edit",
+  input: WriteInput | EditInput,
+): string {
+  const normalizedPath = normalizePath(input.path);
+  return [
+    `The developer edited your proposed ${toolName} for ${normalizedPath}.`,
+    "Do not execute the original proposal.",
+    "Review the developer-edited proposal below for syntax, formatting, and behavior regressions.",
+    "Preserve the developer's intended change; if it is invalid, repair it instead of deleting it.",
+    "The revised proposal must include every developer-added non-whitespace line unless it is impossible to apply.",
+    "Submit one revised edit/write proposal for review.",
+    "",
+    formatDeveloperEditedProposal(toolName, input),
+  ].join("\n");
+}
+
+function formatDeveloperEditedProposal(toolName: "write" | "edit", input: WriteInput | EditInput): string {
+  const maxLength = 8000;
+  const proposal =
+    toolName === "write"
+      ? (input as WriteInput).content
+      : normalizeEditInput(input as EditInput).edits
+          .map((edit, index) =>
+            [`Block ${index + 1} oldText:`, edit.oldText, "", `Block ${index + 1} newText:`, edit.newText].join("\n"),
+          )
+          .join("\n\n");
+
+  const body = proposal.length <= maxLength ? proposal : `${proposal.slice(0, maxLength)}\n... [truncated]`;
+  return `--- developer-edited ${toolName} proposal ---\n${body}`;
 }
 
 export function joinPathList(paths: string[]): string {

@@ -1,6 +1,4 @@
 import { isToolCallEventType, type ExtensionContext, type ToolCallEvent, type ToolCallEventResult } from "@earendil-works/pi-coding-agent";
-import { readFile } from "node:fs/promises";
-import { resolve } from "node:path";
 import { handleReviewAction } from "../ui/review-screen.js";
 import { isPathInReviewScope, loadDiffloopConfig } from "./review-scope.js";
 import type { EditInput, ReviewData, ReviewPlan, WriteInput } from "./review-types.js";
@@ -8,6 +6,7 @@ import type { DiffloopRuntimeState } from "./runtime-state.js";
 import type { DiffViewMode } from "../ui/review-diff-render.js";
 import {
   buildBlockedEditApprovalInstruction,
+  buildDeveloperEditedProposalInstruction,
   buildMissingTargetEditInstruction,
   buildSteeringInstruction,
   joinPathList,
@@ -106,8 +105,6 @@ export async function handleReviewToolCall(
   }
 
   const toolName = event.toolName;
-  let pendingEditedWriteInput: WriteInput | undefined;
-  let proposalEditedInReview = false;
 
   if (!ctx.hasUI) {
     return deps.blockWithReason(
@@ -127,7 +124,6 @@ export async function handleReviewToolCall(
     }
 
     const proposedInput = deps.normalizeToolCallInput(toolName, event.input);
-    deps.sanitizeToolCallInput(event, toolName, proposedInput);
     if (!proposedInput.path) {
       return deps.blockWithReason(
         `Blocked ${toolName}: include a valid path and retry.`,
@@ -187,28 +183,7 @@ export async function handleReviewToolCall(
     const action = await handleReviewAction(ctx, review, deps.diffViewMode, deps.onDiffViewModeChange);
 
     if (action === "approve") {
-      if (toolName === "write" && pendingEditedWriteInput) {
-        deps.sanitizeToolCallInput(event, toolName, pendingEditedWriteInput);
-        deps.state.queuePendingWriteOverride(event.toolCallId, pendingEditedWriteInput.path, pendingEditedWriteInput.content);
-      }
-      if (toolName === "edit" && proposalEditedInReview) {
-        const editInput = proposedInput as EditInput;
-        const normalizedEditPath = normalizePath(editInput.path);
-        if (normalizedEditPath) {
-          try {
-            const baseSnapshot = await readFile(resolve(ctx.cwd, normalizedEditPath), "utf8");
-            deps.state.queuePendingEditOverride(event.toolCallId, editInput.path, editInput.edits, baseSnapshot);
-          } catch {
-            ctx.ui.notify(`Could not read ${normalizedEditPath} before applying reviewed edit; override skipped.`, "warning");
-          }
-        }
-      }
-      if (proposalEditedInReview) {
-        const approvedPath = normalizePath(
-          toolName === "write" && pendingEditedWriteInput ? pendingEditedWriteInput.path : proposedInput.path,
-        );
-        deps.state.queuePendingReviewedMutation(toolName, event.toolCallId, approvedPath);
-      }
+      deps.sanitizeToolCallInput(event, toolName, proposedInput);
       deps.onDecision({
         action: "approve",
         toolName,
@@ -256,16 +231,15 @@ export async function handleReviewToolCall(
       continue;
     }
 
-    if (toolName === "write") {
-      pendingEditedWriteInput = updated as WriteInput;
-    }
-    proposalEditedInReview = true;
-
-    deps.sanitizeToolCallInput(event, toolName, updated);
     deps.onDecision({
       action: "edit",
       toolName,
       path: normalizePath(updated.path),
     });
+    return deps.blockWithReason(
+      `${buildDeveloperEditedProposalInstruction(toolName, updated)}\nNo file changes were applied.`,
+      `${toolName}:developer-edited:${normalizePath(updated.path)}`,
+      { code: "developer-edited", toolName, path: normalizePath(updated.path) },
+    );
   }
 }

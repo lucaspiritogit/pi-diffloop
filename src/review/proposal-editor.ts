@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Editor, Key, matchesKey, type EditorTheme } from "@earendil-works/pi-tui";
 import { spawnSync } from "node:child_process";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -13,6 +14,75 @@ type ExternalEditorResult = {
   errorMessage?: string;
 };
 
+async function openInlineProposalEditor(
+  ctx: ExtensionContext,
+  title: string,
+  initialContent: string,
+): Promise<string | undefined> {
+  return ctx.ui.custom<string | undefined>(
+    (tui, theme, _kb, done) => {
+      const editorTheme: EditorTheme = {
+        borderColor: (text) => theme.fg("accent", text),
+        selectList: {
+          selectedPrefix: (text) => theme.fg("accent", text),
+          selectedText: (text) => theme.fg("accent", text),
+          description: (text) => theme.fg("muted", text),
+          scrollInfo: (text) => theme.fg("dim", text),
+          noMatch: (text) => theme.fg("warning", text),
+        },
+      };
+      const editor = new Editor(tui, editorTheme);
+      let focused = false;
+
+      editor.setText(initialContent);
+      editor.onSubmit = (text) => done(text);
+
+      return {
+        get focused() {
+          return focused;
+        },
+        set focused(value: boolean) {
+          focused = value;
+          editor.focused = value;
+        },
+        handleInput(data: string) {
+          if (matchesKey(data, Key.tab)) {
+            editor.insertTextAtCursor("    ");
+            tui.requestRender();
+            return;
+          }
+          if (matchesKey(data, Key.escape)) {
+            done(undefined);
+            return;
+          }
+          editor.handleInput(data);
+          tui.requestRender();
+        },
+        invalidate() {
+          editor.invalidate();
+        },
+        render(width: number) {
+          return [
+            theme.bold(theme.fg("toolTitle", title)),
+            theme.fg("dim", "Tab inserts 4 spaces. Shift+Enter adds a line. Enter saves. Esc cancels."),
+            "",
+            ...editor.render(width),
+          ];
+        },
+      };
+    },
+    {
+      overlay: true,
+      overlayOptions: {
+        anchor: "bottom-center",
+        width: "100%",
+        maxHeight: "100%",
+        margin: 0,
+      },
+    },
+  );
+}
+
 async function openProposalInEditor(
   ctx: ExtensionContext,
   path: string,
@@ -21,7 +91,7 @@ async function openProposalInEditor(
 ): Promise<string | undefined> {
   const editorCmd = process.env.EDITOR || process.env.VISUAL;
   if (!editorCmd) {
-    return ctx.ui.editor(fallbackTitle, initialContent);
+    return openInlineProposalEditor(ctx, fallbackTitle, initialContent);
   }
 
   const fileExtension = extname(path) || ".txt";
